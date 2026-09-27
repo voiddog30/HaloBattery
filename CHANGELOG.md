@@ -7,6 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- SteelSeries Arctis Nova Pro Omni (base station 1038:2290): the headset's battery, and the
+  level of the spare battery charging in the base station, shown in the tooltip
+  ("Arctis Nova Pro Omni: 75%, spare battery 50%"). Request `01 b0` on interface 3, layout
+  from loteran/Arctis-Sound-Manager. With the base station switch on USB-2 or XBOX nothing
+  can be read, and the diagnostics say which position it is in. Not tested on hardware.
+- Finalmouse UltralightX (ULX) on its 2.4 GHz dongle (361D:0100), with the protocol of
+  Finalmouse's XPanel: battery (state of charge, or the voltage on firmware that does not
+  report it), charging, and whether the mouse is linked. A mouse that is off or asleep keeps
+  its last level on a greyed icon. Not tested on hardware.
+- A provider can add a line to a device's tooltip (`DeviceStatus.extra`).
 - SteelSeries: older and other Arctis headsets. Not tested on these headsets; the raw
   replies go to the diagnostics.
   - On the `b0` exchange (interface 3): Arctis Nova 7P, Nova 3P / 3X Wireless,
