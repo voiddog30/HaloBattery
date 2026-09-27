@@ -11,3 +11,4 @@ from .steelseries import SteelSeriesProvider  # noqa: F401
 from .jbl import JblProvider  # noqa: F401
 from .hyperx import HyperXProvider  # noqa: F401
 from .playstation import PlayStationProvider  # noqa: F401
+from .finalmouse import FinalmouseProvider  # noqa: F401

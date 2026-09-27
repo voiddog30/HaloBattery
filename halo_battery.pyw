@@ -5,7 +5,9 @@ Supported:
   * Audeze Maxwell (2.4 GHz dongle or USB-C cable)
   * WLmouse (Beast X / Beast X Max / Mini Pro)
   * Logitech (HID++ 2.0 mice and keyboards: Lightspeed / Unifying receivers, G HUB not needed)
-  * SteelSeries (Arctis Nova, Arctis 1 / 7 / 9 / Pro Wireless / 7+ headsets, GameBuds, GG not needed)
+  * SteelSeries (Arctis Nova, Nova Pro Omni with its spare battery, Arctis 1 / 7 / 9 / Pro Wireless /
+    7+ headsets, GameBuds, GG not needed)
+  * Finalmouse UltralightX (on its 2.4 GHz dongle)
   * MCHOSE (M7 Ultra and the rest of the 0x5253 family, on the 2.4 GHz receiver)
   * Xbox-compatible controllers (Windows.Gaming.Input / XInput)
   * PlayStation controllers (DualShock 4, DualSense): directly over USB/HID
@@ -61,8 +63,9 @@ import updates  # noqa: E402
 import winevents  # noqa: E402
 from providers import hidlist  # noqa: E402
 from providers import (AudezeProvider, BarracudaProvider, BluetoothProvider, DeviceStatus,  # noqa: E402
-                       HyperXProvider, JblProvider, LogitechProvider, MchoseProvider, PlayStationProvider,
-                       RazerProvider, SteelSeriesProvider, WLmouseProvider, XInputProvider)
+                       FinalmouseProvider, HyperXProvider, JblProvider, LogitechProvider, MchoseProvider,
+                       PlayStationProvider, RazerProvider, SteelSeriesProvider, WLmouseProvider,
+                       XInputProvider)
 from providers.bluetooth import BluetoothWatcher  # noqa: E402
 
 HEADSET_WORDS = ("blackshark", "kraken", "barracuda", "nari", "thresher", "headset",
@@ -417,7 +420,7 @@ class App:
         self.light_taskbar = self.compute_light()
         self.providers = [RazerProvider(), AudezeProvider(), WLmouseProvider(), MchoseProvider(),
                           HyperXProvider(), JblProvider(), LogitechProvider(), SteelSeriesProvider(), XInputProvider(),
-                          PlayStationProvider(), BarracudaProvider()]
+                          PlayStationProvider(), BarracudaProvider(), FinalmouseProvider()]
         self.bt = BluetoothProvider()
         self.icons: Dict[str, DeviceIcon] = {}
         self.placeholder: Optional[pystray.Icon] = None
@@ -982,7 +985,7 @@ def probe():
     app.cfg = load_config()
     app.providers = [RazerProvider(), AudezeProvider(), WLmouseProvider(), MchoseProvider(),
                      HyperXProvider(), JblProvider(), LogitechProvider(), SteelSeriesProvider(), XInputProvider(),
-                     PlayStationProvider(), BarracudaProvider()]
+                     PlayStationProvider(), BarracudaProvider(), FinalmouseProvider()]
     app.bt = BluetoothProvider()
     res = []
     for p in app.providers + [app.bt]:
