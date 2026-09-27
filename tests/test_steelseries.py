@@ -209,6 +209,84 @@ class ClassicTests(SteelSeriesTestCase):
         self.assertEqual({path for path, _ in bus.writes}, {b"right"})
 
 
+# ------------------------------------------------------------------ Nova Pro Omni
+def omni_status(headset=75, spare=50, link=0x08, charging=0x08):
+    """A 01 b0 reply laid out as in Arctis-Sound-Manager's Omni test."""
+    r = [0x00] * 64
+    r[0], r[1] = 0x01, 0xB0
+    r[6], r[7], r[14], r[15] = headset, spare, link, charging
+    return r
+
+
+class NovaProOmniTests(SteelSeriesTestCase):
+    def omni(self, reply, entries=None):
+        entries = entries or [entry(0x2290, 3, 0xFFC0, b"omni")]
+        return self.poll(entries, {b"omni": answer(reply, [0x01, 0xB0])})
+
+    def test_headset_and_spare_battery(self):
+        [st], p = self.omni(omni_status(75, 50))
+        self.assertEqual((st.name, st.level, st.charging, st.online, st.kind),
+                         ("Arctis Nova Pro Omni", 75, False, True, "headset"))
+        self.assertEqual(st.extra, "spare battery 50%")
+        self.assertEqual(self.bus.writes, [(b"omni", [0x01, 0xB0])])
+
+    def test_charging(self):
+        [st], _ = self.omni(omni_status(40, 100, charging=0x02))
+        self.assertEqual((st.level, st.charging), (40, True))
+
+    def test_plugged_in_not_charging(self):
+        [st], _ = self.omni(omni_status(100, 100, charging=0x04))
+        self.assertFalse(st.charging)
+
+    def test_headset_off(self):
+        for link in (0x01, 0x02, 0x04):
+            with self.subTest(link=link):
+                out, _ = self.omni(omni_status(75, 50, link=link))
+                self.assertEqual(out, [])
+
+    def test_push_events_are_skipped(self):
+        """The 07 events the base station pushes on its own are not the status."""
+        events = [[0x07, 0x25, 0x10] + [0] * 13, [0x07, 0xB7, 20, 30, 0x08] + [0] * 11]
+        paths = {b"omni": lambda req: events + [omni_status(66, 88)]}
+        [st], _ = self.poll([entry(0x2290, 3, 0xFFC0, b"omni")], paths)
+        self.assertEqual((st.level, st.extra), (66, "spare battery 88%"))
+
+    def test_level_out_of_range_is_refused(self):
+        out, _ = self.omni(omni_status(0xFF, 50))
+        self.assertEqual(out, [])
+
+    def test_spare_out_of_range_is_left_out(self):
+        [st], _ = self.omni(omni_status(75, 0xFF))
+        self.assertEqual((st.level, st.extra), (75, ""))
+
+    def test_only_vendor_collections_on_interface_3(self):
+        entries = [entry(0x2290, 4, 0x000C, b"keys"), entry(0x2290, 3, 0x000C, b"consumer"),
+                   entry(0x2290, 3, 0xFFC0, b"omni")]
+        bus = self.use(entries, {b"keys": answer(omni_status()), b"consumer": answer(omni_status()),
+                                 b"omni": answer(omni_status(), [0x01, 0xB0])})
+        [st] = S.SteelSeriesProvider().poll()
+        self.assertEqual(st.level, 75)
+        self.assertEqual({path for path, _ in bus.writes}, {b"omni"})
+
+    def test_remembers_the_collection_that_answered(self):
+        entries = [entry(0x2290, 3, 0xFF00, b"silent"), entry(0x2290, 3, 0xFF01, b"omni")]
+        bus = self.use(entries, {b"silent": lambda req: [],
+                                 b"omni": answer(omni_status(), [0x01, 0xB0])})
+        p = S.SteelSeriesProvider()
+        p.poll()
+        bus.writes.clear()
+        [st] = p.poll()
+        self.assertEqual(st.level, 75)
+        self.assertEqual({path for path, _ in bus.writes}, {b"omni"})
+
+    def test_switch_in_usb2_is_named_in_diagnostics(self):
+        bus = self.use([entry(0x2292, 3, 0xFFC0, b"usb2")], {b"usb2": answer(omni_status())})
+        p = S.SteelSeriesProvider()
+        self.assertEqual(p.poll(), [])
+        self.assertEqual(bus.writes, [])
+        self.assertTrue(any("USB-2" in line for line in p.diagnostics()))
+
+
 # ------------------------------------------------------------------ safety
 class SafetyTests(SteelSeriesTestCase):
     def test_classic_never_writes_to_standard_collections(self):

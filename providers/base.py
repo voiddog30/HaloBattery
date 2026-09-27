@@ -21,6 +21,7 @@ class DeviceStatus:
     kind: str = ""               # headset / mouse / keyboard / gamepad when known
                                  # (picks the pictogram); "" = guess from the source
     via: str = ""                # "bluetooth": a controller connected over Bluetooth
+    extra: str = ""              # added to the tooltip, e.g. "spare battery 80%"
 
 
 class Provider:

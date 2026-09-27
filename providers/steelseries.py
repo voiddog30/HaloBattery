@@ -33,8 +33,12 @@ Mouse battery (Rival 3 Wireless and family), from yurtemre7/steel-mouse:
 Older Arctis headsets (Arctis 1, 7, 9, Pro Wireless) use other requests on other
 interfaces: see CLASSIC_MODELS further down.
 
-New models go into MODELS (headsets on the b0 exchange), MOUSE_MODELS (mice) or
-CLASSIC_MODELS (older headsets): product id -> (name, parser ...).
+The Arctis Nova Pro Omni (base station 1038:2290) has a protocol of its own, with the
+level of the spare battery charging in the base station next to the headset's: see
+OMNI_MODELS further down.
+
+New models go into MODELS (headsets on the b0 exchange), MOUSE_MODELS (mice),
+CLASSIC_MODELS (older headsets) or OMNI_MODELS: product id -> (name, parser ...).
 """
 from __future__ import annotations
 
@@ -255,6 +259,49 @@ CLASSIC_MODELS: Dict[int, Tuple[str, int, Optional[int], Callable[[Ask], Reading
 }
 
 
+# ---------------------------------------------------------------- Arctis Nova Pro Omni
+# Layout from loteran/Arctis-Sound-Manager (nova_pro_omni.yaml), which checked it
+# against a USBPcap capture of SteelSeries GG and GG's own device specification:
+#   * interface 3 of the base station; it has no interrupt OUT endpoint, so the
+#     request goes out as an output report with report id 01 (the base station
+#     ignores a request under another report id)
+#   * request 01 b0, reply 01 b0 ... with
+#       byte 6  headset battery, 0..100
+#       byte 7  spare battery in the base station's charging slot, 0..100
+#       byte 14 radio link: 01 not paired, 02 searching, 04 paired but off, 08 connected
+#       byte 15 charging: 02 charging, 04 plugged in but not charging, 08 on battery
+#   * the base station also pushes events prefixed 07 on the same endpoint; they are
+#     skipped
+# The base station has a USB-1 / USB-2 / XBOX switch and only answers on USB-1. In the
+# other positions it enumerates with another product id and stays silent.
+OMNI_INTERFACE = 3
+OMNI_REQUEST = [0x01, 0xB0]
+OMNI_LINK_CONNECTED = 0x08
+OMNI_CHARGING = 0x02
+
+OmniReading = Tuple[Optional[int], bool, bool, Optional[int]]   # + spare battery level
+
+OMNI_MODELS = {
+    0x2290: "Arctis Nova Pro Omni",
+}
+OMNI_SILENT = {
+    0x2292: "USB-2",
+    0x2293: "XBOX",
+}
+
+
+def is_omni_status(r) -> bool:
+    return len(r) >= 16 and r[0] == 0x01 and r[1] == 0xB0
+
+
+def parse_nova_pro_omni(r) -> OmniReading:
+    """01 b0 reply -> (headset level, charging, online, spare battery level)."""
+    if not is_omni_status(r) or r[14] != OMNI_LINK_CONNECTED or r[6] > 100:
+        return None, False, False, None
+    spare = r[7] if r[7] <= 100 else None
+    return r[6], r[15] == OMNI_CHARGING, True, spare
+
+
 class SteelSeriesProvider(Provider):
     name = "steelseries"
 
@@ -395,6 +442,7 @@ class SteelSeriesProvider(Provider):
                 out.append(DeviceStatus(f"steelseries:{pid:04x}", name, level, chg, True,
                                         "steelseries", kind="headset"))
         out += self._poll_classic(infos)
+        out += self._poll_omni(infos)
         return out
 
     def _run_exchange(self, path: bytes, exchange: Callable[[Ask], Reading]):
@@ -453,6 +501,53 @@ class SteelSeriesProvider(Provider):
                     else:
                         self._diag.append("  the headset is off or out of range")
                     break
+        return out
+
+    def _poll_omni(self, infos: List[dict]) -> List[DeviceStatus]:
+        out = []
+        pids = {d["product_id"] for d in infos}
+        for pid, position in OMNI_SILENT.items():
+            if pid in pids:
+                self._diag.append(f"[SteelSeries] pid={pid:04x} Arctis Nova Pro Omni with the "
+                                  f"base station switch on {position}: it only answers on "
+                                  f"USB-1, so the battery cannot be read")
+        for pid, name in OMNI_MODELS.items():
+            # vendor collections only, 0xFFC0 first
+            paths = [d["path"] for d in sorted(
+                (d for d in infos if d["product_id"] == pid
+                 and d.get("interface_number") == OMNI_INTERFACE
+                 and (d.get("usage_page") or 0) >= 0xFF00),
+                key=lambda d: d.get("usage_page") != VENDOR_USAGE_PAGE)]
+            if not paths:
+                if pid in pids:
+                    self._diag.append(f"[SteelSeries] pid={pid:04x} '{name}': no vendor "
+                                      f"collection on interface {OMNI_INTERFACE}")
+                continue
+            self._diag.append(f"[SteelSeries] pid={pid:04x} '{name}'")
+            known = self._classic_path.get(pid)
+            for path in ([known] if known in paths else paths):
+                reply: List[List[int]] = []
+
+                def exchange(ask):
+                    r = ask(OMNI_REQUEST, is_omni_status)
+                    if r is not None:
+                        reply.append(r)
+                    return None, False, False
+
+                _, answered = self._run_exchange(path, exchange)
+                if not answered:
+                    continue
+                self._classic_path[pid] = path
+                level, chg, online, spare = parse_nova_pro_omni(reply[0])
+                if online and level is not None:
+                    extra = f"spare battery {spare}%" if spare is not None else ""
+                    out.append(DeviceStatus(f"steelseries:{pid:04x}", name, level, chg, True,
+                                            "steelseries", kind="headset", extra=extra))
+                    self._diag.append(f"  headset {level}%{' (charging)' if chg else ''}, "
+                                      f"spare battery {spare}%")
+                else:
+                    self._diag.append("  the headset is off or out of range")
+                break
         return out
 
     def diagnostics(self) -> List[str]:

@@ -325,6 +325,8 @@ def describe(st: DeviceStatus) -> str:
             state += ", charging"
         if not st.online:
             state += " (last known value, device asleep)"
+    if st.extra:
+        state += f", {st.extra}"
     return f"{st.name}: {state}"
 
 
