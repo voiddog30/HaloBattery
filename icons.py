@@ -82,26 +82,29 @@ def _mouse(d: ImageDraw.ImageDraw, cx: float, cy: float, s: float, col):
     d.line((_r(cx - w), _r(cy - s * 0.2), _r(cx + w), _r(cy - s * 0.2)), fill=CLEAR, width=lw)
 
 
+def _keycap_k(d: ImageDraw.ImageDraw, cx: float, cy: float, h: float, lw: float):
+    """Cut out a K of height 2h around (cx, cy), with round stroke ends."""
+    x0 = cx - h * 0.48
+    ends = ((x0, cy - h), (x0, cy + h), (cx + h * 0.55, cy - h), (cx + h * 0.58, cy + h))
+    d.line((_r(x0), _r(cy - h), _r(x0), _r(cy + h)), fill=CLEAR, width=_r(lw))
+    xj = x0 + lw * 0.35
+    d.line((_r(xj), _r(cy + h * 0.08), _r(ends[2][0]), _r(ends[2][1])), fill=CLEAR, width=_r(lw))
+    d.line((_r(xj + h * 0.22), _r(cy - h * 0.12), _r(ends[3][0]), _r(ends[3][1])),
+           fill=CLEAR, width=_r(lw))
+    for x, y in ends:
+        d.ellipse((_r(x - lw / 2), _r(y - lw / 2), _r(x + lw / 2), _r(y + lw / 2)), fill=CLEAR)
+
+
 def _keyboard(d: ImageDraw.ImageDraw, cx: float, cy: float, s: float, col):
-    """Keyboard silhouette: a wide, low body with chunky key rows cut out.
+    """Keyboard: one keycap with a K cut out.
 
-    Wide and low is what separates it from the mouse at this size; the keys are cut out
-    rather than drawn (like the mouse's buttons), so the shape reads on a light and a
-    dark taskbar alike."""
-    w, h = s * 1.18, s * 0.52
-    d.rounded_rectangle((_r(cx - w), _r(cy - h), _r(cx + w), _r(cy + h)),
-                        radius=_r(h * 0.3), fill=col)
-    lw = _r(max(2.0, s * 0.16))
-    for dy, n in ((-0.46, 4), (0.02, 4)):
-        span = w * 0.6
-        step = (2 * span) / (n - 1)
-        for i in range(n):
-            x = cx - span + i * step
-            y = cy + dy * h
-            d.line((_r(x - lw * 0.6), _r(y), _r(x + lw * 0.6), _r(y)), fill=CLEAR, width=lw)
-    d.line((_r(cx - w * 0.66), _r(cy + h * 0.5), _r(cx + w * 0.66), _r(cy + h * 0.5)),
-           fill=CLEAR, width=lw)
-
+    A single key reads at 16 px where a whole keyboard with its rows of keys turned into
+    a grey bar; the square keycap is also clearly different from the tall mouse. The K
+    is cut out (like the mouse's buttons), so it shows on a light and a dark taskbar."""
+    a = s * 0.95
+    d.rounded_rectangle((_r(cx - a), _r(cy - a), _r(cx + a), _r(cy + a)),
+                        radius=_r(a * 0.3), fill=col)
+    _keycap_k(d, cx + a * 0.02, cy, a * 0.58, max(3.2, s * 0.25))
 
 
 def _bluetooth(d: ImageDraw.ImageDraw, cx: float, cy: float, s: float, col):
@@ -191,17 +194,57 @@ def _dualshock(d: ImageDraw.ImageDraw, cx: float, cy: float, s: float, col):
 
 PICTOS = {"headset": (_headset, 0, 2, 18), "mouse": (_mouse, 0, 0, 19.5),
           "bluetooth": (_bluetooth, 0, 0, 18), "gamepad": (_gamepad, 0, 0, 18.4),
-          "keyboard": (_keyboard, 0, 0, 15.5),
+          "keyboard": (_keyboard, 0, 0, 17),
           "dualshock": (_dualshock, 0, -0.2, 18.4),
           "dualsense": (_dualshock, 0, -0.2, 18.4)}   # its own silhouette is still to come
+
+
+# ---------------------------------------------------------------- percentage
+# The number in the ring ("Percentage in the icon"). A tray icon is shown at 16-24 px,
+# so the digits are as large and as bold as the inside of the ring allows: two digits
+# fill TEXT_WIDTH of the icon, "100" gets smaller rather than touching the ring.
+TEXT_WIDTH = 40.0          # of the 64-unit icon
+TEXT_HEIGHT = 30.0
+_FONT_FILES = ("segoeuib.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf")
+
+
+@lru_cache(maxsize=32)
+def _font(size: int):
+    from PIL import ImageFont
+    for name in _FONT_FILES:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size)      # Pillow 10.1+: a scalable built-in font
+    except TypeError:                            # pragma: no cover - older Pillow
+        return ImageFont.load_default()
+
+
+def _number(d: ImageDraw.ImageDraw, text: str, col) -> None:
+    """Draw `text` centred in the ring, as large as TEXT_WIDTH x TEXT_HEIGHT allows."""
+    size = _r(TEXT_HEIGHT * 1.4)
+    for _ in range(6):                           # shrink until it fits (2-3 steps at most)
+        font = _font(size)
+        x0, y0, x1, y1 = d.textbbox((0, 0), text, font=font)
+        w, h = x1 - x0, y1 - y0
+        scale = min(_r(TEXT_WIDTH) / max(w, 1), _r(TEXT_HEIGHT) / max(h, 1))
+        if scale >= 0.98:
+            break
+        size = max(8, int(size * scale))
+    # centre the ink, not the font's line box, so digits sit in the middle of the ring
+    d.text((_r(32) - (x0 + x1) / 2, _r(32) - (y0 + y1) / 2), text, font=font, fill=col)
 
 
 # ---------------------------------------------------------------- icon
 def render(level: Optional[int], charging: bool, online: bool, low: int = 20,
            light_taskbar: Optional[bool] = None, badge: str = "",
-           pulse: float = 1.0) -> Image.Image:
+           pulse: float = 1.0, text: str = "") -> Image.Image:
     """badge - device kind: headset / mouse / keyboard / bluetooth (or H / M / K / B).
-    pulse - arc brightness 0..1 (a frame of the charging "breathing" animation)."""
+    pulse - arc brightness 0..1 (a frame of the charging "breathing" animation).
+    text - drawn in the centre instead of the pictogram (the battery percentage); red or
+    amber like the arc when the level is low, the taskbar colour otherwise."""
     if light_taskbar is None:
         light_taskbar = taskbar_is_light()
     fg = (0, 0, 0) if light_taskbar else (255, 255, 255)
@@ -232,9 +275,12 @@ def render(level: Optional[int], charging: bool, online: bool, low: int = 20,
                 x, y = 32 + rr * math.cos(t), 32 + rr * math.sin(t)
                 d.ellipse((_r(x - w / 2), _r(y - w / 2), _r(x + w / 2), _r(y + w / 2)), fill=c)
 
-    # device pictogram
+    # the percentage, or else the device pictogram
     kind = KINDS.get(badge)
-    if kind:
+    if text:
+        col = arc_color(level, False, low, fg) if active else fg
+        _number(d, text, col + (alpha,))
+    elif kind:
         fn, dx, dy, s = PICTOS[kind]
         fn(d, 32 + dx, 32 + dy, s, fg + (alpha,))
 
@@ -254,9 +300,10 @@ def breath_level(phase: float) -> float:
 
 
 def charging_frames(level: Optional[int], online: bool, low: int = 20,
-                    light_taskbar: Optional[bool] = None, badge: str = ""):
+                    light_taskbar: Optional[bool] = None, badge: str = "", text: str = ""):
     """All "breathing" frames for the current state (rendered once and cached)."""
-    return [render(level, True, online, low, light_taskbar, badge, breath_level(i / BREATH_FRAMES))
+    return [render(level, True, online, low, light_taskbar, badge, breath_level(i / BREATH_FRAMES),
+                   text=text)
             for i in range(BREATH_FRAMES)]
 
 
@@ -366,6 +413,16 @@ def _capture(x: int, y: int, w: int, h: int, out_w: int, out_h: int) -> Optional
         user32.ReleaseDC(None, hdc)
 
 
+def _dpi_scale() -> float:
+    """The primary screen's scale (1.25 at 125 %). The app is DPI aware, so screen
+    coordinates are real pixels and the logical sizes below are multiplied by it."""
+    try:
+        import ctypes
+        return max(1.0, ctypes.windll.user32.GetDpiForSystem() / 96)
+    except Exception:
+        return 1.0
+
+
 def _screen_size():
     ctypes, wintypes, user32, gdi32 = _win32()
     return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)       # SM_CXSCREEN, SM_CYSCREEN
@@ -377,8 +434,9 @@ def grab_top_bar(bar_height: int = 24) -> Optional[Image.Image]:
         return None
     sw, _sh = _screen_size()
     x0 = int(sw * 0.6)
-    h = max(4, bar_height - 8)
-    return _capture(x0, 4, sw - x0, h, min(sw - x0, 400), h)
+    k = _dpi_scale()
+    h = max(4, round((bar_height - 8) * k))
+    return _capture(x0, round(4 * k), sw - x0, h, min(sw - x0, 400), h)
 
 
 _pid_names: dict = {}
@@ -444,10 +502,11 @@ def _under_bar_points():
     get_ex.restype = ctypes.c_ssize_t
     get_ex.argtypes = [ctypes.c_void_p, ctypes.c_int]
     sw, _sh = _screen_size()
+    y = round(UNDER_BAR_Y * _dpi_scale())
     out = []
     for fx in UNDER_BAR_XS:
         x = int(sw * fx)
-        hwnd = user32.WindowFromPoint(wintypes.POINT(x, UNDER_BAR_Y))
+        hwnd = user32.WindowFromPoint(wintypes.POINT(x, y))
         if not hwnd:
             out.append((x, "", "", False))
             continue

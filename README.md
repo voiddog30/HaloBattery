@@ -1,6 +1,6 @@
 # Halo Battery
 
-Shows the battery level of wireless devices in the Windows system tray. Each device gets its own icon: a battery ring with the device pictogram in the middle. No Synapse or other vendor software required.
+Battery levels for wireless mice, keyboards, headsets and controllers in the Windows system tray - one icon per device, no vendor software.
 
 ![All icon states](docs/icons.png)
 
@@ -8,92 +8,114 @@ While charging, the arc slowly "breathes":
 
 ![Charging animation](docs/charging.gif)
 
-## Supported devices
+Each device gets its own tray icon: a battery ring with the device's pictogram in the middle. The arc fills clockwise from the top, turns amber as the level approaches your alert threshold and red at or below it, and breathes green while the device charges. Hover over an icon for the exact percentage; right-click it to rename, hide, change the preferences or take a diagnostics report.
 
-Tested on real hardware:
-
-| Device | Connection | How the battery is read |
-|---|---|---|
-| Razer Barracuda Pro (2.4 GHz) | 2.4 GHz dongle (1532:053a) | Its receiver publishes two collections and neither answers the standard Razer mouse request this app sends. The headset speaks the "PA" protocol instead: 64-byte vendor frames, `P`,`A` out and `P`,`I` back, battery command `0x21` with the level in the reply's data byte, charging `0x2A`. Decoded from a USBPcap capture of Razer Synapse on a real unit (it read 34%), then confirmed on hardware with @phl23's own Barracuda Pro: the level tracks (27% at the test), charging follows the charger, and a switched-off headset reports "no link" rather than a stale value. Over Bluetooth Windows reports the level itself. |
-| Razer BlackShark V2 Pro (2023) | 2.4 GHz receiver (1532:0555) | The headset's own "PA" protocol: output reports 0x02 on the vendor interface 0xFF00, remote mode 0xE1, commands 0x21 (battery) and 0x2A (charging) |
-| WLmouse Beast X Max | 8K receiver (36A7:A880) and USB cable | Feature request `02 02 00 83`; if there is no reply, the mouse heartbeat is used. Receiver and cable share one icon |
-| Razer Basilisk V3 Pro, Razer Basilisk Ultimate (tested by users) | 2.4 GHz receiver | The standard Razer 90-byte feature report, as used by Synapse and OpenRazer: power class 0x07, commands 0x80 (battery) and 0x84 (charging) |
-| Razer DeathAdder V4 Pro | 2.4 GHz receiver (1532:00BF) | Same mice protocol: transaction id 0x1F, command class 0x07, command 0x80 answers `02 1f 00 00 00 02 07 80 00 ab`, and raw 0xAB = 171/255 = 67%, stable across polls and unchanged while Synapse runs. Idle, the mouse answers status 04 and keeps its last level on a greyed icon |
-| Audeze Maxwell | 2.4 GHz dongle (3329:4B19) and USB-C cable (3329:4B1A) | The vendor collection (usage page 0xFF13): the sequence HeadsetControl uses, whose answer carries the battery as attribute 0x0CD6 (`05 5D <len> 00 D6 0C <percent>`). One packet is enough — the query for that attribute is answered with the marker on its own (0.19 s against 1.48 s for the whole sequence) — with the full sequence as the fallback. Dongle and cable are one headset and share one icon; charging is inferred from the cable answering, so the icon breathes while it sits on USB-C. With the headset switched off the dongle keeps answering with the last value it held, so the provider goes by the dongle's own product string — `"Audeze Maxwell Dongle"` with no headset linked, `"Audeze Maxwell HID"` with one — and reports nothing: the icon leaves the tray the way any switched-off device does |
-| MCHOSE M7 Ultra | 2.4 GHz receiver (5253:1020) | The vendor collection (usage page 0xFF01; the sibling 0xFF0B never answers): feature report 0x11 (the shorter report, tried first) or 0x12 with command 0x06, every payload byte inverted, which returns `53 52 31 00 02 05 07 00 09 64 00 64` — vid 0x5253, model 0x31, firmware, flags, then the level and the charging byte (1 while charging). The request has to be repeated for each read, and the receiver only relays a real value while the mouse is awake: asleep it answers with zeros, so a silent mouse keeps its last level on a greyed icon. On the cable the mouse answers on its own PID (5253:0031, the number it reports as its model id) and the receiver goes quiet: both connections share one icon, and whichever one reports charging wins |
-| MCHOSE G7 | USB (A8A5:2255, chip 'YJX-CHIP') | A different chip from the M7 Ultra, and a different protocol: a 65-byte output report `00 55 30 A5 0B 2E 01 01 01`, answered by an input report starting `AA 30` whose byte 8 is the level and byte 9 the charging flag. Written from @kek353's own monitor and the device dump in [#8](https://github.com/HeyOkay/HaloBattery/issues/8); only its 0xFF01 vendor collection is written to. Confirmed on @kek353's G7, which answers `aa 30 a5 0b 0a 01 01 01 2e 00 00 00` — 46%, not charging, the same level their own tool shows — and again on its cable (`aa 30 a5 3c 0a 01 01 01 2e 01 00 00`, byte 9 = 1 while charging) with the PID unchanged, so a G7 keeps one icon on the dongle or on the cable. Only the `AA 30` header is relied on: byte 3 differs between the two (`0x0b` against `0x3c`). A level out of range is refused rather than shown |
-| MCHOSE A7 V2 Ultra | 2.4 GHz receiver (3837:100B, RealTek strings) | The same protocol as the M7 Ultra on MCHOSE's newer vendor id, which the reference driver treats identically: the diagnostics in [#4](https://github.com/HeyOkay/HaloBattery/issues/4) show the same interface shape (collections 0xFF0B:0x104 and 0xFF01:0x01 on interface 2). The status read is documented on the shorter 0x11 report, so both report ids are tried, and the mouse is named from the receiver's own product string. Icon of its own, so it and an M7 Ultra stay two devices. **Unverified** — no A7 V2 Ultra was on hand, so a level out of range is refused rather than shown |
-| HyperX Cloud II Wireless | 2.4 GHz dongle (03F0:0696, and 03F0:018B on the newer dongle revision) | The vendor collection, picked by usage page rather than position (0xFF90:0x0303): the dongle carries four collections on the one interface, so the first one is not the right one. A 52-byte output report `06 ff bb <command> 00` is answered by 20 bytes echoing the command: command 0x02 carries the level in byte 7 (voltage in bytes 5-6), command 0x03 reports charging in byte 4 - the same exchange HeadsetControl uses for these two product ids. **Unverified** - no Cloud II Wireless was on hand, so a reply that does not echo the command is ignored and a level above 100 refused rather than shown |
-| GameSir G7 Pro; FlyDigi Vader Pro (tested by users) | 2.4 GHz receiver (shows up as an Xbox controller) | Windows.Gaming.Input battery report: exact percentage and charging state. XInput is the fallback (four levels only) |
-| Sony DualShock 4 (PS4) | USB cable and Bluetooth (054C:09CC) | Read straight from the HID input report: exact percentage and charging state (USB byte 30; over Bluetooth the full report is enabled first, then byte 32) |
-| Sony DualSense (PS5) | USB or Bluetooth | Read straight from the HID input report (byte 53); over Bluetooth the full report is enabled first with a feature-report read. |
-| Logitech G502 LIGHTSPEED, G502 X PLUS | Lightspeed receiver (046D:C539, 046D:C547) | HID++ 2.0 on the receiver's vendor interface: the device name (feature 0x0005) and the first battery feature the device supports (0x1004 unified battery, 0x1000 battery status or 0x1001 battery voltage; the G502 LIGHTSPEED reports voltage, converted to % with the Li-ion curve used by Solaar, the G502 X PLUS the unified battery percentage). The icon follows the device's unit id (feature 0x0003). Works alongside G HUB |
-| SteelSeries Arctis Nova 7 | 2.4 GHz dongle (1038:22A1) | Output report `00 b0` on interface 3 (usage page 0xFFC0); the reply carries the level and the status (off / charging / on battery), as documented by HeadsetControl. Works alongside SteelSeries GG. The other Nova 7 variants and the Nova 5 / 5X use the same request and are included, but not tested |
-| SteelSeries Rival 3 Wireless | 2.4 GHz dongle (1038:1830) | The mouse exchange on the same interface and the same `0xFFC0` configuration collection as the headsets, but not the `b0` request: a 64-byte `00 aa 01 ...` out, answered by a report carrying the level. The two references disagree about the reply and neither has been on hardware here, so both shapes are read: a reply that echoes `aa` (level in byte 1, charging in byte 3, as yurtemre7/steel-mouse reads it) and a 3-byte reply read the way flozz/rivalcfg does (level in byte 0, charging in byte 2, the same request and the same hidapi read). A leading report id byte of `0x00` is skipped, a level above 100 is refused in both shapes, and in the 3-byte shape the charging byte has to be 0 or 1 so a stray report cannot pass as a level - the diagnostics print the raw reply and say which shape was used. The collection is picked by usage page `0xFFC0` rather than by interface number, because the Rival 650 has it on interface 0 (rivalcfg issue #202). Works alongside SteelSeries GG; the Gen 2 revision (1038:1872) is included untested |
-| SteelSeries Arctis Nova Pro Omni | GameHub base station (1038:2290), switch on USB-1 | Output report `01 b0` (report id 1) on the vendor collection of interface 3; the reply `01 b0 ...` carries the headset level in byte 6 and the level of the spare battery charging in the base station in byte 7 (both 0-100), the radio link in byte 14 (`08` = connected) and the charging state in byte 15 (`02` = charging). The spare battery is shown in the tooltip next to the headset, e.g. "Arctis Nova Pro Omni: 75%, spare battery 50%". The events the base station pushes on its own (`07 ...`) are skipped. Layout from [loteran/Arctis-Sound-Manager](https://github.com/loteran/Arctis-Sound-Manager), which checked it against a capture of SteelSeries GG. The base station only answers with its switch on USB-1: on USB-2 (1038:2292) or XBOX (1038:2293) nothing can be read, and the diagnostics say so. **Unverified** - no Omni was on hand, so a level above 100 is refused rather than shown |
-| Finalmouse UltralightX (ULX) | 2.4 GHz dongle (361D:0100) | The protocol of Finalmouse's own web configurator, XPanel: output report 04 `<length> <0x80 \| command> <payload length>` on the dongle's vendor collection (usage page 0xFF00), answered by input report 05. Command 36 is the link state (0 = the mouse is not connected), 38 the battery (state of charge in percent, then the voltage), 37 charging; firmware that does not answer 38 is read through command 5, the voltage, with XPanel's discharge curve. A mouse that is off or asleep keeps its last level on a greyed icon for 5 minutes. On its USB cable (361D:0102) the mouse only takes firmware updates, so it is read through the dongle. **Unverified** - no ULX was on hand; the framing matches the settings writes captured by [johnklucinec/ulx_reverse](https://github.com/johnklucinec/ulx_reverse) |
-| JBL Quantum 910 Wireless | 2.4 GHz dongle (0ECB:2088) | The receiver exposes one vendor collection, `ff13:0001` (interface 5 on a real unit), and the headset pushes its own reports there; there is no request to send. The battery arrives as report 0x08 with the level in byte 1 - the pattern plugato/JBL_Baterry_Monitor confirmed on this USB id - and report 0x2f is the microphone mute state. The headset can stay quiet for long stretches, so the last level heard is kept and shown greyed out until something arrives. **Confirmed on a real unit**: the provider finds the receiver, matches its collection and shows the level as soon as the headset reports. That report is an event - on the unit tested it arrives when the headset is plugged into its charger (a capture read 95% at the moment JBL's own app said 95%), and pressing the buttons or the volume rocker does not produce it - so the last level heard is kept and shown greyed out until the next one. The receiver also pushes a power report (0x09 - byte 1 is `0x00` when the headset is switched off and `0x01` when it is on, confirmed on a real unit - plus a 0x02 frame); none of them is a level, and a headset last seen switched off says so in the diagnostics rather than only "nothing heard" |
-| Bluetooth devices, tested on the 1MORE SonoFlow headset (users also report Audio-Technica and JBL Tune 760NC headphones working) | Bluetooth (on by default, can be turned off in the menu) | The level Windows itself knows (`DEVPKEY_Bluetooth_Battery`). Only devices connected right now are shown: the link state comes from WinRT (`BluetoothDevice.ConnectionStatus`, the same source as Windows Settings). A device that is also read over HID keeps one icon: the HID reading wins and the Bluetooth copy is dropped |
-
-Support for other devices is not guaranteed. The code already reads the other Razer wireless mice whose battery OpenRazer reads (Pro Click, Pro Click V2 and V2 Vertical, Naga, Viper, DeathAdder, Basilisk, Mamba, Lancehead and others; the list is `KNOWN` in `providers/razer.py`), includes protocols for some other WLmouse models, should read most other Logitech HID++ 2.0 mice and keyboards on a Lightspeed or Unifying receiver and the other Arctis Nova 7 and Nova 5 models, reads the older Arctis 1 / 7 / 9 / Pro Wireless / 7+ and GameBuds the way HeadsetControl documents them, reads other Xbox-compatible controllers the same way as the GameSir G7 Pro and works with any Bluetooth device whose battery level Windows reports, but these have not been tested. New devices are added based on feedback and diagnostics logs: if yours is not detected or shows a wrong level, open an issue and attach the diagnostics report (see [Troubleshooting](#troubleshooting)).
-
-Two limitations of the Maxwell support are worth stating rather than leaving to be discovered. Two Maxwells on one machine share a single icon: both endpoints report the serial `0000000000000000`, so nothing distinguishes them over HID and only the first one is read. And the Xbox cable PID (`3329:4B1E`) is derived from the Xbox dongle (`3329:4B18`) by the same +1 offset that separates the PC dongle `3329:4B19` from its cable `3329:4B1A` — it has not been measured against an Xbox model, so an Xbox cable may be read as `3329:4B18` and shown as not charging.
+Levels are read over USB/HID (a dongle, a receiver or a cable), from Xbox-style controller reports, and from Windows itself for Bluetooth devices.
 
 ## Installation
 
-### Option 1: ready-made .exe (recommended)
+### Option 1: the ready-made .exe (recommended)
 
 1. Download `HaloBattery-<version>.zip` from the [Releases](../../releases/latest) page.
-2. Extract it somewhere permanent, e.g. `C:\Tools`, so you get `C:\Tools\HaloBattery\HaloBattery.exe`, and run `HaloBattery.exe`. Keep the whole `HaloBattery` folder together: the .exe needs the `_internal` folder next to it.
+2. Extract it somewhere permanent, e.g. `C:\Tools`, so you get `C:\Tools\HaloBattery\HaloBattery.exe`, and run `HaloBattery.exe`. Keep the `HaloBattery` folder together: the .exe needs the `_internal` folder next to it.
 3. Right-click the tray icon → **Start with Windows**.
 
-The app checks GitHub for a new release once a day and, when there is one, adds **Download vX.Y.Z…** to the tray menu (it only opens the release page; nothing is installed for you). To update, close the app (tray menu → **Exit**) and replace the folder with the new one. If you used the old single-file `HaloBattery.exe`, delete it; **Start with Windows** follows the new copy automatically the first time you run it.
+The app checks for a new release once a day and adds **Download vX.Y.Z…** to the menu when there is one. To update: tray menu → **Exit**, then replace the folder; **Start with Windows** follows the new copy. If you used the old single-file `HaloBattery.exe`, delete it.
 
-No Python or other dependencies required. Windows SmartScreen may warn about an unrecognized app on first launch, because the file is not code-signed: click **More info → Run anyway**. Some antivirus programs flag unsigned Python apps by mistake (typically a generic machine-learning detection with `!ml` in its name, such as `Trojan:Win32/Sabsik.TE.A!ml`). The release is built by GitHub Actions straight from this repository, and the build logs are public; if in doubt, run it from source (Option 2).
+Windows SmartScreen may warn about an unrecognized app on first launch, because the file is not code-signed: **More info → Run anyway**. Some antivirus tools flag unsigned Python apps by mistake (usually a generic `!ml` detection). The release is built by GitHub Actions straight from this repository, with public build logs; if you would rather not trust it, use Option 2.
 
 ### Option 2: from source
 
 1. Install [Python 3.10+](https://www.python.org/downloads/) with **Add python.exe to PATH** checked.
 2. Download or clone this repository somewhere permanent, e.g. `C:\Tools\HaloBattery`.
-3. Run `install_and_run.bat`.
-4. Right-click the tray icon → **Start with Windows**.
+3. Run `install_and_run.bat`, then right-click the tray icon → **Start with Windows**.
 
-To build it yourself, run `build_exe.bat`; the result is the `dist\HaloBattery` folder with `HaloBattery.exe` inside.
+### Portable mode
 
-Releases are built automatically: pushing a tag like `v1.8.0` makes GitHub Actions build Halo Battery on Windows and attach `HaloBattery-<version>.zip` to the release (see `.github/workflows/release.yml`).
+To keep the settings, the log and the battery history next to the app instead of in `%APPDATA%\HaloBattery` (for a USB stick or a folder you sync), create an empty file named `portable.txt` in the app's folder, next to `HaloBattery.exe` (or `halo_battery.pyw` when running from source), and restart the app. The folder must be writable: if it is not (e.g. inside `C:\Program Files`), the app keeps using `%APPDATA%\HaloBattery`. Settings are not moved over by themselves: copy `config.json` from `%APPDATA%\HaloBattery` to keep them. **Start with Windows** still adds an entry to the registry of the current user.
 
-## The icon
+`build_exe.bat` builds it yourself into `dist\HaloBattery`. Releases are built automatically: pushing a tag like `v1.8.0` makes GitHub Actions build the app and attach the zip (`.github/workflows/release.yml`).
 
-The icon is a battery ring with the device pictogram in the middle. The arc fills clockwise from the top.
+## Features
 
-- Centre: a headset, a mouse, a gamepad or the Bluetooth rune. The pictogram can be turned off in the menu.
-- Normal arc uses the taskbar colour: white on a dark taskbar, black on a light one. With [MyDockFinder](https://store.steampowered.com/app/1787090/MyDockFinder/) running, the colour follows its top menu bar instead, which switches with the wallpaper. With a transparent taskbar (e.g. TranslucentTB) pick **Icon colour → White** or **Black** in the menu.
-- Amber arc: the level is close to the alert threshold. Red: at or below it.
-- Green arc that slowly "breathes": charging. The animation can be turned off in the menu, leaving a plain green arc.
-- Translucent icon: the mouse is asleep; it keeps its last level for 5 minutes. A device that is switched off disappears from the tray and comes back when it is switched on.
+### The icon
 
-Hover over the icon to see the exact percentage. The low battery notification fires once and only again after the device has been charged.
+- **Centre**: a headset, a mouse, a keyboard (a keycap with a K), an Xbox or PlayStation controller, or the Bluetooth rune - the pictogram can be turned off in the menu.
+- **Colour**: follows the taskbar (white on a dark bar, black on a light one). With [MyDockFinder](https://store.steampowered.com/app/1787090/MyDockFinder/) running it follows its top menu bar instead. With a transparent taskbar (e.g. TranslucentTB) pick **Icon colour → White** or **Black**.
+- **Amber**: close to the alert threshold. **Red**: at or below it.
+- **Green and breathing**: charging - the animation can be turned off in the menu, leaving a plain green arc.
+- **Translucent**: the mouse is asleep and keeps its last level for 5 minutes. A device that is switched off leaves the tray and comes back when it is switched on.
 
-## Tray menu
+The low battery notification fires once, and again only after the device has been charged.
 
-- **Refresh now**, **Poll interval** (15 s to 5 min), **Low battery alert at** (off, 10–30%)
-- **Windows Bluetooth devices**, **Device pictogram**, **Charging animation**
-- **Icon colour**: Automatic (the Windows theme, or MyDockFinder's menu bar while it is running), White or Black
-- **Start with Windows** (per-user registry key, no admin rights needed)
-- **Check for updates**: once a day, on by default; a notification and a **Download vX.Y.Z…** item appear when a new release is out
+### Tray menu
+
+Right-click a device icon to open its menu. It looks like a Windows 11 menu (acrylic background, rounded corners, the light or dark app theme) and is sharp at any display scale. If it does not work on your PC, set `"fluent_menu": false` in `%APPDATA%\HaloBattery\config.json` to get the classic Windows menu back.
+
+- **Rename…**: give the device your own name (for example, two controllers with the same name). **Reset name** goes back to the device's own name.
+- **Icon**: pick the pictogram of this device (Automatic, Mouse, Keyboard, Headset, Controller or Bluetooth), for example a controller over Bluetooth that shows the Bluetooth pictogram.
+- **Low battery alert at**: an alert level for this device only (off, 10–30%), or **Default** to follow Preferences. The red ring follows it too.
+- **Hide this device**: remove its icon, for example for a controller that always reports 100%.
+- **Refresh now**
+- **Preferences**:
+  - **Poll interval** (15 s to 5 min) and **Low battery alert** (off, 10–30%): change them with the − and + buttons or the mouse wheel, the menu stays open
+  - **Alert when fully charged** (a notification once per charge, on by default)
+  - **Estimated time left**: "about 5 h of use left" in the tooltip, from how fast the device has drained since its last charge. Only time the device is awake and on battery counts, and there is no estimate until it has been used for 30 minutes and dropped 3%. The history is kept in `%APPDATA%\HaloBattery\history.json`.
+  - **Quiet while gaming** (on by default): while a game or other app is full screen (the same signal Windows uses to hold its own notifications), alerts are held and shown once it closes - one per device, and a low battery alert is dropped if the device was put on the charger meanwhile. Devices are polled only every 5 minutes then, since every poll talks to them; plugging something in still updates at once.
+  - **Sound with the low battery alert** (off by default): also play the Windows "Battery Low" sound ("Battery Critical" at 5% or less), for full-screen games where the notification is not seen. It plays again every 5 minutes while the device stays low and off the charger, and **Quiet while gaming** does not hold it back
+  - **Windows Bluetooth devices**, **Device pictogram**, **Percentage in the icon** (the level as a number in the ring instead of the pictogram, amber or red when low), **Charging animation**
+  - **PlayStation full mode (Bluetooth)** (off by default): always read the battery of a PS4 / PS5 controller over Bluetooth. Some games stop seeing the controller in that mode until it is turned off and on
+  - **Status file for other apps** (off by default): writes `%APPDATA%\HaloBattery\status.json` after every poll, for Rainmeter, a Stream Deck plugin or a script. Each device has `name`, `level`, `charging`, `online`, `kind`, `seconds_left` and the tooltip `text`; `running` turns false when the app exits, and `updated_unix` says how fresh it is. Turning it off deletes the file.
+  - **Device types**: turn off a brand or device family; its devices are then not opened at all
+  - **Icon colour**: Automatic (the Windows theme, or MyDockFinder's menu bar while it is running), White or Black
+  - **Start with Windows** (per-user registry key, no admin rights needed)
+  - **Check for updates**: once a day, on by default; a notification and a **Download vX.Y.Z…** item appear when a new release is out
+- **Hidden devices** (only when a device is hidden): click a device to show it again
 - **Diagnostics…**: writes a detailed report and opens it
+
+## Supported devices
+
+Mice, keyboards, headsets and controllers from Razer, Logitech, SteelSeries, HyperX, Corsair, ASUS ROG, Sony, Xbox, Nintendo, 8BitDo, GameSir, Audeze, JBL, Keychron, MCHOSE, WLmouse, G-Wolves, LAMZU, Lofree, Pulsar / ATK VXE, Angry Miao, Hitscan and more, over a 2.4 GHz receiver, a USB cable or Bluetooth.
+
+**[See the full list of supported devices](docs/devices.md)**. It shows the connection and whether each device has been tested on real hardware.
+
+## Add your device
+
+Is your device not detected, or does it show a wrong level? Send a diagnostics report. It takes approximately one minute:
+
+1. Close the maker's software (Synapse, G HUB, the web driver and similar) and wake the device up (move the mouse, press a key).
+2. Right-click a Halo Battery icon and select **Diagnostics…**. The "No devices found" icon has this item too.
+
+   <picture>
+     <source media="(prefers-color-scheme: dark)" srcset="docs/contributing/diagnostics-menu-dark.png">
+     <img src="docs/contributing/diagnostics-menu-light.png" alt="The tray menu of a device, with the Diagnostics item marked" width="381">
+   </picture>
+
+3. The report `diagnostics.txt` opens in Notepad. [Open an issue](../../issues/new?template=device.yml), write the device name and how it is connected (receiver, cable or Bluetooth), and drag the file into the comment box. The file is in `%APPDATA%\HaloBattery`.
+
+The report contains Bluetooth MAC addresses and device serial numbers. You can replace them with `xx` before you post.
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has the details: what the report shows, how to record a USB capture of the maker's app when the protocol is not known, and how to open a pull request.
 
 ## Troubleshooting
 
-1. Close Synapse, the WLmouse web driver and other battery tools: they may hold the receiver.
+1. Close Synapse, the WLmouse web driver and other battery tools - they may hold the receiver.
 2. Wake the mouse up by moving it.
-3. Run `probe.bat` or choose **Diagnostics…** from the tray menu. The report lists every HID device and the raw protocol replies. Attach it to an issue in this repository to get a new device supported. The report contains Bluetooth MAC addresses and device serial numbers; you may want to redact them before posting.
+3. Run `probe.bat` or choose **Diagnostics…** from the tray menu, and send the report as [Add your device](#add-your-device) tells you.
+4. **"python312.dll was not found"**, or **Start with Windows** says the app runs from a temporary folder: the app was started straight from the ZIP, or only `HaloBattery.exe` was copied out of it. Extract the whole ZIP to a folder of its own (the `_internal` folder must stay next to the .exe) and run `HaloBattery.exe` from there.
 
-Settings, the log and the diagnostics report live in `%APPDATA%\HaloBattery`.
+Settings, the log and the diagnostics report live in `%APPDATA%\HaloBattery` (in the app's own folder in [portable mode](#portable-mode)). The first line of the diagnostics report shows which folder is used.
 
 ## Credits
 
-The WLmouse protocol was reverse-engineered by @len0c ([incconutwo/mouse-battery-tray](https://github.com/incconutwo/mouse-battery-tray), MIT). The MCHOSE protocol comes from the write-up by @alexfrih ([alexfrih/mchose-linux](https://github.com/alexfrih/mchose-linux), recovered from MCHOSE's own web driver), with the details this mouse forced noted in `providers/mchose.py`. The MCHOSE G7 protocol comes from @kek353's own monitor and the device dump they posted in [#8](https://github.com/HeyOkay/HaloBattery/issues/8). The BlackShark V2 Pro 2023 protocol comes from the OpenRazer driver ([PR #2862](https://github.com/openrazer/openrazer/pull/2862)). Razer PIDs and transaction IDs come from OpenRazer and [RazerBatteryTaskbar](https://github.com/Tekk-Know/RazerBatteryTaskbar). The Arctis Nova Pro Omni status layout comes from [loteran/Arctis-Sound-Manager](https://github.com/loteran/Arctis-Sound-Manager). The Finalmouse UltralightX protocol comes from Finalmouse's XPanel web configurator.
+- WLmouse protocol: @len0c ([incconutwo/mouse-battery-tray](https://github.com/incconutwo/mouse-battery-tray), MIT).
+- MCHOSE protocol: the write-up by @alexfrih ([alexfrih/mchose-linux](https://github.com/alexfrih/mchose-linux), recovered from MCHOSE's own web driver); the G7 from @kek353's monitor and the dump in [#8](https://github.com/HeyOkay/HaloBattery/issues/8).
+- Hitscan Hyperlight protocol: @sopparus ([sopparus/hitscan-battery](https://github.com/sopparus/hitscan-battery)), who mapped it from the vendor application's USB traffic and confirmed it in the [libratbag discussion](https://github.com/libratbag/libratbag/issues/1893).
+- AM Infinity 8K protocol: the AJAZZ Control Center project ([Aiacos/ajazz-control-center](https://github.com/Aiacos/ajazz-control-center), GPL-3.0), which reads the same USB id on its own AJ159 APEX unit.
+- BlackShark V2 Pro 2023: the OpenRazer driver ([PR #2862](https://github.com/openrazer/openrazer/pull/2862)). Razer PIDs and transaction ids: OpenRazer and [RazerBatteryTaskbar](https://github.com/Tekk-Know/RazerBatteryTaskbar).
+- Arctis Nova Pro Omni status layout: [loteran/Arctis-Sound-Manager](https://github.com/loteran/Arctis-Sound-Manager).
+- Finalmouse UltralightX protocol: Finalmouse's XPanel web configurator.
+- The reference implementations behind individual devices - HeadsetControl, rivalcfg, Solaar, G-Helper, HyperHeadset, mouse.xyz, [`@openmouse/protocol`](https://github.com/OpenMouse-Project/openmouse), keychron-battery-dkms, JBL_Baterry_Monitor and others - are credited next to the device they were used for in [docs/protocols.md](docs/protocols.md).
 
 ## License
 

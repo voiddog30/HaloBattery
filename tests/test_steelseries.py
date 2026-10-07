@@ -209,6 +209,82 @@ class ClassicTests(SteelSeriesTestCase):
         self.assertEqual({path for path, _ in bus.writes}, {b"right"})
 
 
+# ------------------------------------------------------------- Nova Pro Wireless
+def nova_pro_reply(code=5, state=0x08, length=16):
+    """A base station's battery reply: nine-step level code in byte 6, state in byte 15."""
+    r = [0x00] * max(length, 16)
+    r[0], r[6], r[15] = 0xB0, code, state
+    return r[:length]
+
+
+class NovaProTests(SteelSeriesTestCase):
+    """The two base stations answer report id 06, on interface 3 or 4 (HeadsetControl
+    asks on interface 4); the level is a nine-step code and byte 15 is the gate."""
+
+    def poll_nova_pro(self, reply, pid=0x12E0, iface=4, page=0xFF00):
+        entries = [entry(pid, iface, page, b"np")]
+        return self.poll(entries, {b"np": answer(reply, request=[0x06, 0xB0])})
+
+    def test_the_request_is_06_b0(self):
+        st, _ = self.poll_nova_pro(nova_pro_reply(5, 0x08))
+        self.assertEqual([(x.level, x.charging, x.kind) for x in st], [(62, False, "headset")])
+        self.assertEqual([w[1] for w in self.bus.writes], [[0x06, 0xB0]])
+
+    def test_every_step_of_the_nine_step_scale(self):
+        for code, pct in enumerate([0, 12, 25, 37, 50, 62, 75, 87, 100]):
+            st, _ = self.poll_nova_pro(nova_pro_reply(code, 0x08))
+            self.assertEqual([(x.level, x.approx) for x in st],
+                             [(pct, "about %d%%" % pct)], "code %d" % code)
+
+    def test_the_state_byte_is_the_gate(self):
+        for state in (0x00, 0x03, 0x04, 0x80, 0xFF):
+            self.assertEqual(self.poll_nova_pro(nova_pro_reply(5, state))[0], [], hex(state))
+
+    def test_headset_off_gives_no_reading(self):
+        st, p = self.poll_nova_pro(nova_pro_reply(5, 0x01))
+        self.assertEqual(st, [])                                  # not 0 %
+        self.assertTrue(any("off or out of range" in line for line in p.diagnostics()))
+
+    def test_cable_charging(self):
+        [st] = self.poll_nova_pro(nova_pro_reply(5, 0x02))[0]
+        self.assertEqual((st.level, st.charging, st.online), (62, True, True))
+
+    def test_short_reply_is_refused(self):
+        self.assertEqual(self.poll_nova_pro(nova_pro_reply(5, 0x08, length=15))[0], [])
+
+    def test_level_code_above_8_is_refused(self):
+        self.assertEqual(self.poll_nova_pro(nova_pro_reply(9, 0x08))[0], [])
+
+    def test_interface_3_is_accepted_too(self):
+        [st] = self.poll_nova_pro(nova_pro_reply(8, 0x08), iface=3)[0]
+        self.assertEqual(st.level, 100)
+
+    def test_the_x_station_is_recognised(self):
+        st, _ = self.poll_nova_pro(nova_pro_reply(5, 0x08), pid=0x12E5)
+        self.assertEqual([x.name for x in st], ["Arctis Nova Pro Wireless X"])
+
+    def test_only_vendor_collections_get_the_request(self):
+        """A standard (audio/consumer) collection on interface 4 is never written to."""
+        bus = self.use([entry(0x12E0, 4, 0x0001, b"audio")],
+                       {b"audio": answer(nova_pro_reply(), request=[0x06, 0xB0])})
+        self.assertEqual(S.SteelSeriesProvider().poll(), [])
+        self.assertEqual(bus.writes, [])
+
+    def test_a_stray_report_before_the_reply_is_ignored(self):
+        paths = {b"np": lambda req: [[0x01, 0x00, 0x63, 0x02], nova_pro_reply(5, 0x08)]}
+        [st] = self.poll([entry(0x12E0, 4, 0xFF00, b"np")], paths)[0]
+        self.assertEqual(st.level, 62)
+
+    def test_the_nova_7_path_is_untouched_beside_it(self):
+        entries = [entry(0x12E0, 4, 0xFF00, b"np"), entry(0x22A1, 3, 0xFFC0, b"n7")]
+        paths = {b"np": answer(nova_pro_reply(5, 0x08), request=[0x06, 0xB0]),
+                 b"n7": answer([0xB0, 0x03, 0x49, 0x03], request=[0x00, 0xB0])}
+        st, _ = self.poll(entries, paths)
+        self.assertEqual({x.name: x.level for x in st},
+                         {"Arctis Nova Pro Wireless": 62, "Arctis Nova 7": 73})
+        self.assertEqual(sorted(w[1] for w in self.bus.writes), [[0x00, 0xB0], [0x06, 0xB0]])
+
+
 # ------------------------------------------------------------------ Nova Pro Omni
 def omni_status(headset=75, spare=50, link=0x08, charging=0x08):
     """A 01 b0 reply laid out as in Arctis-Sound-Manager's Omni test."""
