@@ -41,6 +41,19 @@ KNOWN = {
     0x0556: ("Razer BlackShark V2 Pro (2023)", 0x3F),
     0x0557: ("Razer BlackShark V2 Pro (2023)", 0x3F),
     0x00A4: ("Razer Mouse Dock Pro", 0x1F),
+    # ---- keyboards with a battery, from OpenRazer's keyboard driver (razerkbd_driver.c:
+    # razer_attr_read_charge_level). The wireless id is the HyperSpeed receiver, the
+    # wired id the keyboard on its cable (charging).
+    0x0290: ("Razer DeathStalker V2 Pro", 0x9F),
+    0x0292: ("Razer DeathStalker V2 Pro", 0x1F),
+    0x0296: ("Razer DeathStalker V2 Pro TKL", 0x9F),
+    0x0298: ("Razer DeathStalker V2 Pro TKL", 0x1F),
+    0x0271: ("Razer BlackWidow V3 Mini HyperSpeed", 0x9F),
+    0x0258: ("Razer BlackWidow V3 Mini HyperSpeed", 0x1F),
+    0x02BA: ("Razer BlackWidow V4 Mini HyperSpeed", 0x9F),
+    0x02B9: ("Razer BlackWidow V4 Mini HyperSpeed", 0x1F),
+    0x02D5: ("Razer BlackWidow V4 Tenkeyless HyperSpeed", 0x9F),
+    0x02D7: ("Razer BlackWidow V4 Tenkeyless HyperSpeed", 0x1F),
     # ---- mice, from OpenRazer (wired / wireless PIDs of one mouse share a name)
     0x001F: ("Razer Naga Epic", 0xFF),
     0x0024: ("Razer Mamba (2012)", 0xFF),
@@ -105,6 +118,25 @@ KNOWN = {
     0x00D4: ("Razer Basilisk Mobile", 0x1F),
     0x00D6: ("Razer Basilisk V3 Pro 35K Phantom Green", 0x1F),
     0x00D7: ("Razer Basilisk V3 Pro 35K Phantom Green", 0x1F),
+
+    # Keyboards with a battery. OpenRazer's RazerBlackWidowV3ProWired (0x025A) lists
+    # get_battery/is_charging, and the wireless model (0x025C) inherits that class.
+    # razer_attr_read_charge_level() reads both with razer_chroma_misc_get_battery_level()
+    # - the same 0x07:0x80 / 0x07:0x84 commands this provider already sends - and sets
+    # the transaction id to 0x9f for the wireless keyboards of this generation and 0x3f
+    # for their wired twins. 0x3f is not a value this keyboard answers on: the wired id
+    # goes only to 0x025A.
+    0x025A: ("Razer BlackWidow V3 Pro", 0x3F),
+    0x025C: ("Razer BlackWidow V3 Pro", 0x9F),
+}
+
+# The keyboards above take the commands on one USB interface: OpenRazer sends them with
+# wIndex = report_index to the interface (USB_RECIP_INTERFACE), in
+# razer_get_report_params(). That interface is asked first; the others stay a fallback.
+KEYBOARD_INTERFACE = {
+    0x0290: 2, 0x0296: 2, 0x02D5: 2,
+    0x0292: 3, 0x0298: 3, 0x02D7: 3,
+    0x0271: 3, 0x0258: 3, 0x02BA: 3, 0x02B9: 3,
 }
 
 TRANSACTION_IDS = (0x1F, 0x3F, 0xFF, 0x9F, 0x08)
@@ -124,6 +156,14 @@ STATUS_OK = 0x02
 STATUS_BUSY = 0x01
 STATUS_TIMEOUT = 0x04     # receiver present, device not responding (off / asleep)
 STATUS_NOT_SUPPORTED = 0x05
+# Not a Razer status byte (those fit in a byte): every packet read back belonged to
+# another command, i.e. to another app that talks to the same collection. RGB software
+# sending lighting frames (class 0x0f) does this many times a second, and each of its
+# requests overwrites the device's reply buffer (issue #108: 13 reads in a row carried
+# "0f:03", OpenRazer's set_custom_frame, with a new transaction id each time).
+STATUS_FOREIGN = 0x100
+# how many times one request is sent while only foreign packets come back
+SENDS = 3
 
 # How long a device that stopped answering keeps its last value, greyed out (the
 # translucent icon the README describes for a sleeping mouse), before the icon goes
@@ -183,13 +223,19 @@ class RazerProvider(Provider):
         self._last: Dict[str, Tuple[int, bool, float]] = {}   # last good level per device
 
     # ---- low level -------------------------------------------------------
-    def _query(self, dev, tid: int, cmd_class: int, cmd_id: int) -> Tuple[Optional[int], Optional[int]]:
-        req = build_request(tid, cmd_class, cmd_id)
+    def _send(self, dev, req: bytes, tid: int) -> bool:
         try:
             dev.send_feature_report(b"\x00" + req)
         except (OSError, ValueError) as e:
             self._diag.append(f"    send tid={tid:02x}: {e}")
+            return False
+        return True
+
+    def _query(self, dev, tid: int, cmd_class: int, cmd_id: int) -> Tuple[Optional[int], Optional[int]]:
+        req = build_request(tid, cmd_class, cmd_id)
+        if not self._send(dev, req, tid):
             return None, None
+        sends, foreign = 1, 0
         # The device does not reply instantly: poll for up to ~1 s while status is "busy".
         deadline = time.time() + 1.0
         time.sleep(0.06)
@@ -217,10 +263,25 @@ class RazerProvider(Provider):
             # verified on that hardware; reading on is strictly better than stopping.
             # (only a success status can hide somebody else's packet: 04 asleep and 05
             # not supported are final answers and come back right away)
-            if time.time() < deadline and (status == STATUS_BUSY
-                                           or (status == STATUS_OK and value is None)):
+            is_foreign = status == STATUS_OK and value is None
+            if time.time() < deadline and (status == STATUS_BUSY or is_foreign):
+                if is_foreign:
+                    foreign += 1
+                    # The other app's request may have replaced ours before the device
+                    # read it, and then our answer never comes: ask again, a few times.
+                    if foreign % 4 == 0 and sends < SENDS:
+                        if not self._send(dev, req, tid):
+                            return None, None
+                        sends += 1
+                        self._diag.append(f"    sent tid={tid:02x} again ({sends} of {SENDS})")
                 time.sleep(0.08)
                 continue
+            if is_foreign:
+                # a success status on somebody else's packet is not an answer to ours
+                self._diag.append("    every reply was for another command: another app "
+                                  "(Synapse, Chroma or other RGB software) is using this "
+                                  "collection; close it to read the battery")
+                return STATUS_FOREIGN, None
             return status, value
 
     def _read(self, path: bytes, tid: int) -> Tuple[Optional[int], Optional[int], Optional[bool]]:
@@ -247,6 +308,23 @@ class RazerProvider(Provider):
 
     # ---- high level ------------------------------------------------------
     def poll(self) -> List[DeviceStatus]:
+        """One icon for a mouse on its cable while its receiver stays plugged in.
+
+        On the cable the mouse is a second PID with the same name in KNOWN, and the
+        receiver then answers "not responding". Its greyed copy of the last level stayed
+        next to the live icon of the cable for ASLEEP_KEEP. A greyed icon is dropped when
+        another PID of the same model answers in the same poll. Two live icons stay: that
+        is two mice of the same model, one on the receiver and one on the cable."""
+        out = self._poll_devices()
+        models = {name for name, _tid in KNOWN.values()}
+        live: Dict[str, set] = {}       # model name -> PIDs that answered (key "razer:<pid>:...")
+        for s in out:
+            if s.online and s.name in models:
+                live.setdefault(s.name, set()).add(s.key.split(":")[1])
+        return [s for s in out
+                if s.online or not live.get(s.name, set()) - {s.key.split(":")[1]}]
+
+    def _poll_devices(self) -> List[DeviceStatus]:
         self._diag = []
         try:
             infos = hidlist.enumerate(RAZER_VID)
@@ -282,6 +360,7 @@ class RazerProvider(Provider):
             if not name:
                 name = (ifaces[0].get("product_string") or f"Razer {pid:04x}").strip()
             key = f"razer:{pid:04x}:{serial}"
+            kind = "keyboard" if pid in KEYBOARD_INTERFACE else ""
             diag_from = len(self._diag)
             self._diag.append(f"[Razer] {name} pid={pid:04x}, interfaces: {len(ifaces)}")
             if not maybe_wireless(pid, name):
@@ -308,7 +387,9 @@ class RazerProvider(Provider):
             if st is None or st[0] != STATUS_OK:
                 # failed poll: the details go to the log once, when the device stops
                 # answering (or the reason changes), not on every poll while it is off
-                reason = "no reply" if st is None else f"status {st[0]:02x}"
+                reason = ("no reply" if st is None else
+                          "only replies for another app" if st[0] == STATUS_FOREIGN else
+                          f"status {st[0]:02x}")
                 if self._failing.get(key) != reason:
                     self._failing[key] = reason
                     log.info("[Razer] %s: poll failed (%s); not logged again until it changes",
@@ -327,32 +408,34 @@ class RazerProvider(Provider):
                 # sleeping one, so they keep exactly the behaviour they had before.
                 last = self._last.get(key)
                 if not is_headset and last and time.time() - last[2] < ASLEEP_KEEP:
-                    out.append(DeviceStatus(key, name, last[0], last[1], False, "razer"))
+                    out.append(DeviceStatus(key, name, last[0], last[1], False, "razer", kind=kind))
                 continue
             elif self._failing.pop(key, None) is not None:
                 log.info("[Razer] %s: answering again", name)
             status, level, charging = st
             if status == STATUS_OK:
                 self._last[key] = (level, bool(charging), time.time())
-                out.append(DeviceStatus(key, name, level, bool(charging), True, "razer"))
+                out.append(DeviceStatus(key, name, level, bool(charging), True, "razer", kind=kind))
         return out
 
     def _poll_group(self, gkey, ifaces, pref_tid):
         cached = self._cache.get(gkey)
         if cached:
             status, level, charging = self._read(cached.path, cached.tid)
-            if status in (STATUS_OK, STATUS_TIMEOUT):
+            if status in (STATUS_OK, STATUS_TIMEOUT, STATUS_FOREIGN):
                 return status, level, charging
             self._cache.pop(gkey, None)
 
         # Probe order: vendor / main collection interfaces first, then the rest.
         # Collections Windows re-parented (interface number -1) go last.
+        want = KEYBOARD_INTERFACE.get(gkey[0])
+
         def rank(d):
             up = d.get("usage_page", 0)
             iface = d.get("interface_number", 0)
             if iface is None or iface < 0:
                 iface = 99
-            return (0 if up in (0x0001, 0xFF00) else 1, iface)
+            return (0 if iface == want else 1, 0 if up in (0x0001, 0xFF00) else 1, iface)
 
         tids = [pref_tid] if pref_tid else []
         tids += [t for t in TRANSACTION_IDS if t not in tids]
@@ -378,6 +461,12 @@ class RazerProvider(Provider):
                     timeout_hit = (status, None, None)
                     self._cache[gkey] = _Cand(path, tid)
                     break
+                if status == STATUS_FOREIGN:
+                    # Another app's replies arrive here, so this is the collection that
+                    # takes the Razer commands. The other transaction ids and interfaces
+                    # would only cost another second each: keep this one and stop.
+                    self._cache[gkey] = _Cand(path, tid)
+                    return status, None, None
             if not answered:
                 self._dead[path] = now + 300   # leave this interface alone for 5 minutes
         return timeout_hit
@@ -390,6 +479,7 @@ class RazerProvider(Provider):
         if cached:
             cands.sort(key=lambda d: 0 if d["path"] == cached.path else 1)
         offline = None
+        asleep = None
         for d in cands:
             self._diag.append(
                 f"  [PA] iface={d.get('interface_number')} usage={d.get('usage_page', 0):04x}:"
@@ -398,11 +488,26 @@ class RazerProvider(Provider):
             if res == "ok":
                 self._cache[cache_key] = _Cand(d["path"], 0)
                 return STATUS_OK, level, charging
-            if res == "offline" and offline is None:
-                offline = (STATUS_TIMEOUT, None, None)
-                if cached and d["path"] == cached.path:
-                    break      # working interface is known, the headset is just off
-        return offline
+            if res == "offline":
+                # The interface accepted a command and the headset did not answer: this is the
+                # collection that speaks the protocol, with the headset switched off. Remember
+                # it, so an off headset costs one probe per poll instead of one per collection
+                # (measured: 2 probes -> 1 with two vendor collections, ~0.7 s each), and stop
+                # walking the list.
+                self._cache[cache_key] = _Cand(d["path"], 0)
+                if offline is None:
+                    offline = (STATUS_TIMEOUT, None, None)
+                break
+            if res == "nowake" and asleep is None:
+                # The interface opened but never accepted a command - which is also what a
+                # wrong collection looks like, so it must NOT be cached. If a wrong path were
+                # cached, the sort above would put it first and its "offline" would break the
+                # loop every time, so the collection that actually works would never be
+                # reached again and a headset switched on later would never be read.
+                # Keep it only as the fallback answer, so a receiver that is asleep still
+                # shows "no link" (STATUS_TIMEOUT) instead of losing its icon.
+                asleep = (STATUS_TIMEOUT, None, None)
+        return offline or asleep
 
     def diagnostics(self) -> List[str]:
         return list(self._diag)
