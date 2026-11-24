@@ -21,11 +21,13 @@ class TextTests(unittest.TestCase):
         self.assertEqual(hb.low_battery_text("G502", 15, False), "G502: 15% left. Time to charge.")
         self.assertEqual(hb.low_battery_text("Pad", None, True), "Pad: battery is low. Time to charge.")
         self.assertEqual(hb.fully_charged_text("G502"), "G502 is fully charged.")
-        self.assertIn("Download v1.2.3…", hb.update_text("1.2.3"))
+        self.assertIn("\"Update to v1.2.3\"", hb.update_text("1.2.3"))
+        self.assertIn("\"Download v1.2.3…\"", hb.update_text("1.2.3", install=False))
 
     def test_real_low_battery_alert_uses_the_shared_text(self):
         app = make_app({"low": 20})
-        with mock.patch.object(hb, "DeviceIcon", __import__("test_hide_rename").FakeIcon):
+        with mock.patch.object(hb, "DeviceIcon", __import__("test_hide_rename").FakeIcon), \
+                mock.patch.object(hb, "fullscreen_app_running", return_value=False):
             app.apply([dev(level=10)])
         self.assertEqual(app.notes, [hb.low_battery_text("G502 LIGHTSPEED", 10, False)])
 

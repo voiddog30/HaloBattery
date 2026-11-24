@@ -6,9 +6,13 @@ Protocol from Sapd/HeadsetControl's corsair_void_v2w device:
   * the vendor collection on the receiver, which HeadsetControl identifies by
     interface 4 (it gives no usage page/usage for it, so the interface number is
     the only handle on that collection; a probe logs whatever it actually finds).
-  * commands are 65 bytes: [0] 0x00 report id, [1] 0x02, [2] endpoint,
-    [3] 0x02, [4] command. Endpoint 0x08 is the receiver itself, 0x09 the
-    headset behind it. Replies are 64 bytes.
+  * commands are 64 bytes with no leading report id: [0] 0x02, [1] endpoint,
+    [2] 0x02, [3] command. Endpoint 0x08 is the receiver itself, 0x09 the
+    headset behind it. Replies are 64 bytes. HeadsetControl writes the same
+    message with a 0x00 report id in front (65 bytes), which Windows refuses
+    on this family before it reaches the device (0x57, headsetcontrol#521) -
+    so the 64-byte shape goes out first and the rid-prefixed one is only a
+    fallback (see _write_frame).
   * talking to a sleeping headset needs the same minimal handshake
     HeadsetControl uses - receiver firmware query, receiver heartbeat, then a
     headset heartbeat - which is enough to read the battery without switching
@@ -16,10 +20,60 @@ Protocol from Sapd/HeadsetControl's corsair_void_v2w device:
   * battery: command 0x0f to endpoint 0x09 -> reply[4] | reply[5] << 8 is a
     0..1000 value, ten times the percent. The receiver sometimes answers with
     the paired headset id instead of a level, so a reading of 0 or above 1000 is
-    retried a few times and then refused rather than shown.
+    retried a few times and then refused rather than shown. **Confirmed on
+    hardware**: #28's reporter's run of the fixed build shows the level (his
+    probe's accepted-write reply reads `01 01 02 00 2a 03` = 81 %).
 
 The reply carries no charging flag: HeadsetControl reports the level as
 available (not charging) for this family, and so does this provider.
+
+The Dark Core RGB Pro SE (dongle 1b1c:1b7f) speaks the newer Corsair protocol
+that ckb-next calls "bragi" (USES_BRAGI in src/daemon/usb.h; bragi_proto.h,
+device_bragi.c) and OpenLinkHub "slipstream" (src/devices/slipstream/): 64-byte
+routed frames behind report id 0, 65 bytes to hidapi. Byte 1 is the route (0x08
+the receiver itself, 0x08 | child the device behind it; 0x09 = the paired
+mouse), byte 2 the command (0x02 = get) and byte 3 the property (battery level
+0x0F). An answer is `[route][0x02][err][value]...`: err 0 means OK, and the
+battery sits little-endian in bytes 3-4 in tenths of a percent - both drivers
+divide by 10. The 1.13.0 build asked this dongle with ckb-next's "nxp" packet;
+the reporter's runs in #56 showed it never answers that one, and that one of
+its *other* frames parsed as a level was the 0 % flash. The request above and
+its `01 02 00 26 02 ...` answer (55 %) were captured from the reporter's
+dongle, and the exchange is confirmed on hardware: KKiruano's test build run
+showed the same level SignalRGB does. The answer echoes the command, not the
+property, so a second app on the same dongle (iCUE, SignalRGB) can put an
+answer for another property on the channel that parses as a level; the ask is
+therefore repeated and only two equal answers are taken, the wait is a time
+window (traffic frames end a 500 ms read early), and a per-dongle budget
+bounds the try-every-collection fallback (review by @ahmedkhursheed23). The
+Virtuoso RGB Wireless SE receiver (1b1c:0a40) runs the same exchange with two
+measured differences (#204, jeffpeng3's Linux proof-of-concept and the Windows
+probe): Windows refuses every report-id-prefixed write on it and takes the bare
+64-byte frame - which also carries a leading 0x02 the Dark Core's frame does not
+have (`02 09 02 0f` against `09 02 0f`) - and its headset reports the charge
+state on property 0x10 (1 charging, 2 on battery). It is read with the full
+session that was measured on it - firmware query, receiver heartbeat, headset
+heartbeat, then the properties.
+
+The rest of the Virtuoso family is the same exchange on the ids HeadsetControl's
+reworked Virtuoso XT/SE device covers (#570): the SE's own receiver 1b1c:0a3e and
+its cable 1b1c:0a3d, the XT's receiver 1b1c:0a64 and its cable 1b1c:0a62. The wired
+ids read with target 0x08 first and the receivers with 0x09, each with the other as
+the fallback, and reads need neither the session nor software mode (HeadsetControl
+notes only writes need software mode). Those four ran on HeadsetControl's author's
+hardware (#568/#570 discussion) and have not answered a build here; the 0a40 is
+measured. The Dark Core's wired id 1b1c:1b7e stays out - nothing can prove it
+answers.
+
+The `--probe` run (#28) digs deeper than the tray ever should: every write's
+return value, every frame with the time it took to arrive, a listen-only pass
+before writing anything (with the vendor app open it catches the vendor's own
+exchange), and - when the usual sequence yields nothing - the vendor app's
+fuller software-mode path. It also prints every collection's declared report
+lengths and tries the battery frame in each framing on every collection,
+because a write Windows refuses locally looks exactly like a switched-off
+device. Normal polling keeps the short windows; a provider runs on the tray's
+timer and must never block it.
 
 The Dark Core / Ironclaw mice and their dongles speak a second, unrelated
 protocol ("nxp" in ckb-next, which reads them): a single-field 64-byte packet
@@ -29,11 +83,23 @@ ckb-next's source is the reference (src/daemon/nxp_proto.h and device.c,
 repo ckb-next/ckb-next; its protocol notes live in ckb-next/corsair-protocol).
 The status byte's meaning is not written down in either, so no charging state
 is reported, and the level is coarse, so it is shown as "about N%".
+
+The K65 PLUS Wireless keyboard's receiver (1b1c:2b07, #154) runs the same routed
+exchange as the Dark Core's dongle: route 0x09 asks the paired keyboard for property
+0x0F on the ff42:0001 collection, and the answer carries the level in tenths in bytes
+3-4. OpenLinkHub's own K65 Plus dongle handler (src/devices/k65plusWdongle) sends
+``cmdBatteryLevel {0x02, 0x0F}`` on the 65-byte report-id-0 frame and reads the value
+as a little-endian uint16 from the reply's bytes 3-4, so this id mirrors that; no
+charge property is read, because that handler reports none. Confirmed on the
+reporter's own unit (#154): his test build run showed 100 % (`01 02 00 e8 03`).
 """
 from __future__ import annotations
 
+import ctypes
+import os
+import sys
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import hid
 
@@ -65,6 +131,116 @@ ATTEMPTS = 3
 READ_TIMEOUT_MS = 500
 FLUSH_TIMEOUT_MS = 30
 
+# The --probe run (#28): this family's answers can arrive late, and the vendor
+# app's own traffic is part of the picture, so the probe listens first and then
+# talks with longer windows. The tray keeps the short ones above.
+PROBE_LISTEN_MS = 6000
+PROBE_HB_TIMEOUT_MS = 3000
+PROBE_ATTEMPT_TIMEOUT_MS = (2000, 4000, 4000)
+PROBE_SOFTWARE_TIMEOUT_MS = (2000, 4000)
+
+
+def in_probe() -> bool:
+    """True inside `halo_battery.pyw --probe` (which sets HALO_PROBE)."""
+    return os.environ.get("HALO_PROBE") == "1"
+
+
+class _HIDP_CAPS(ctypes.Structure):
+    _fields_ = [("Usage", ctypes.c_ushort), ("UsagePage", ctypes.c_ushort),
+                ("InputReportByteLength", ctypes.c_ushort),
+                ("OutputReportByteLength", ctypes.c_ushort),
+                ("FeatureReportByteLength", ctypes.c_ushort),
+                ("Reserved", ctypes.c_ushort * 17),
+                ("NumberLinkCollectionNodes", ctypes.c_ushort),
+                ("NumberInputButtonCaps", ctypes.c_ushort),
+                ("NumberInputValueCaps", ctypes.c_ushort),
+                ("NumberInputDataIndices", ctypes.c_ushort),
+                ("NumberOutputButtonCaps", ctypes.c_ushort),
+                ("NumberOutputValueCaps", ctypes.c_ushort),
+                ("NumberOutputDataIndices", ctypes.c_ushort),
+                ("NumberFeatureButtonCaps", ctypes.c_ushort),
+                ("NumberFeatureValueCaps", ctypes.c_ushort),
+                ("NumberFeatureDataIndices", ctypes.c_ushort)]
+
+
+def caps_for(path) -> Optional[Tuple[int, int, int]]:
+    """(input, output, feature) report byte lengths of one HID collection.
+
+    The handle is opened with no access rights (query only), so nothing is sent
+    to the device. Windows-only, like the rest of the probe machinery.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        p = path.decode("utf-8", "ignore") if isinstance(path, (bytes, bytearray)) else str(path)
+        k32, hidd = ctypes.windll.kernel32, ctypes.windll.hid
+        k32.CreateFileW.restype = ctypes.c_void_p
+        handle = k32.CreateFileW(p, 0, 3, None, 3, 0, None)   # no access, share r/w, open existing
+        if handle in (None, ctypes.c_void_p(-1).value):
+            return None
+        try:
+            pp = ctypes.c_void_p()
+            if not hidd.HidD_GetPreparsedData(ctypes.c_void_p(handle), ctypes.byref(pp)):
+                return None
+            try:
+                caps = _HIDP_CAPS()
+                if hidd.HidP_GetCaps(pp, ctypes.byref(caps)) != 0x00110000:   # HIDP_STATUS_SUCCESS
+                    return None
+                return (caps.InputReportByteLength, caps.OutputReportByteLength,
+                        caps.FeatureReportByteLength)
+            finally:
+                hidd.HidD_FreePreparsedData(pp)
+        finally:
+            k32.CloseHandle(ctypes.c_void_p(handle))
+    except Exception:            # a probe must never take the provider down
+        return None
+
+
+def _error_note(dev, n) -> str:
+    """The OS reason behind a refused write, when hidapi reports one."""
+    if not isinstance(n, int) or n >= 0:
+        return ""
+    try:
+        err = dev.error()
+    except Exception:
+        return ""
+    return f" ({err})" if err else ""
+
+# Direct USB mode of the original HS80 RGB Wireless (1b1c:0a69). This is
+# distinct from the 0a6b receiver exchange above: it answers command 02 0f on
+# target 08. Protocol/layout: ST1CKEL/HS80_Control docs/PROTOCOL.md and PR #2,
+# measured on real hardware: https://github.com/ST1CKEL/HS80_Control/pull/2
+HS80_USB_PID = 0x0A69
+HS80_CHARGING_CABLE_PID = 0x0A6A  # switched-off headset while connected to USB power
+HS80_USB_INTERFACE = 3
+HS80_USB_USAGE_PAGE = 0xFF42
+HS80_USB_TARGET = 0x08
+HS80_USB_COMMAND_BATTERY = (0x02, 0x0F)
+HS80_USB_REPORT_SIZE = 64
+HS80_USB_READ_ATTEMPTS = 3
+HS80_USB_READ_TIMEOUT_MS = 500
+
+
+def hs80_usb_request(target: int = HS80_USB_TARGET) -> bytes:
+    """Build a 64-byte battery-query report for the HS80 control interface."""
+    return bytes([0x02, target, *HS80_USB_COMMAND_BATTERY]
+                 + [0x00] * (HS80_USB_REPORT_SIZE - 4))
+
+
+def parse_hs80_usb_battery(report, target: int = HS80_USB_TARGET) -> Optional[int]:
+    """Decode a matched HS80 response for target 0x08 (USB) or 0x09 (receiver)."""
+    if not report or len(report) < 6:
+        return None
+    r = list(report)
+    # Report 0x01; response channel is target minus 0x08; command family 0x02, OK.
+    if r[0] != 0x01 or r[1] != target - 0x08 or r[2] != 0x02 or r[3] != 0x00:
+        return None
+    tenths = r[4] | (r[5] << 8)
+    if tenths > 1000:
+        return None
+    return tenths // 10
+
+
 PIDS = {
     0x2A08: "Corsair Void v2 Wireless",
     0x2A02: "Corsair Virtuoso Max Wireless",
@@ -77,42 +253,187 @@ def make_request(endpoint: int, sub: int, command: int) -> List[int]:
     return frame + [0x00] * (MSG_SIZE_WRITE - len(frame))
 
 
-# --- second family: the "nxp" protocol of the Dark Core / Ironclaw mice --------------------
+def make_software_mode(endpoint: int) -> List[int]:
+    """`01 03 00 02` to an endpoint - the vendor app's software-mode switch.
+
+    HeadsetControl's initializeDevice() and OpenLinkHub's Connect() both send it
+    before commands work on a cold device. The headset can pop audibly when the
+    mode changes, which is why normal polling avoids it.
+    """
+    frame = [0x00, 0x02, endpoint, 0x01, 0x03, 0x00, 0x02]
+    return frame + [0x00] * (MSG_SIZE_WRITE - len(frame))
+
+
+# --- second family: the "bragi" / "slipstream" exchange of the Dark Core RGB Pro SE dongle ---
 # A wired mouse (1b1c:1b7e) exists too; nothing here can prove it answers, so only the
 # dongle is read.
-NXP_PIDS = {
+BRAGI_PIDS = {
     0x1B7F: "Corsair Dark Core RGB Pro SE",
+    0x2B07: "Corsair K65 PLUS Wireless",
+    0x1BDC: "Corsair M75 Wireless",
+    0x0A40: "Corsair Virtuoso RGB Wireless SE",
+    0x0A3E: "Corsair Virtuoso RGB Wireless SE",
+    0x0A3D: "Corsair Virtuoso RGB Wireless SE",
+    0x0A64: "Corsair Virtuoso RGB Wireless XT",
+    0x0A62: "Corsair Virtuoso RGB Wireless XT",
 }
-NXP_USAGE_PAGE = 0xFF42          # the dongle's two vendor collections, from the #56 dump
-NXP_CMD_GET = 0x0E               # ckb-next: CMD_GET
-NXP_FIELD_BATTERY = 0x50         # ckb-next: FIELD_BATTERY
-NXP_MSG_SIZE = 64                # ckb-next: MSG_SIZE (structures.h)
-NXP_LEVEL_INDEX = 4
-NXP_STATUS_INDEX = 5
-NXP_LEVELS = (0, 15, 30, 50, 100)   # ckb-next's nxp_battery_lut
+# the pictogram each family member draws: the Dark Core is a mouse, the K65 PLUS a
+# keyboard; the Virtuoso ids are headsets
+BRAGI_KINDS = {0x1B7F: "mouse", 0x2B07: "keyboard", 0x1BDC: "mouse"}
+# one icon per product: a headset's receiver and cable ids share the key
+BRAGI_KEYS = {
+    0x1B7F: "corsair:1b7f",
+    0x2B07: "corsair:2b07",
+    0x1BDC: "corsair:1bdc",
+    0x0A40: "corsair:virtuoso-se",
+    0x0A3E: "corsair:virtuoso-se",
+    0x0A3D: "corsair:virtuoso-se",
+    0x0A64: "corsair:virtuoso-xt",
+    0x0A62: "corsair:virtuoso-xt",
+}
+BRAGI_VENDOR_PAGE = 0xFF42       # the dongle's two vendor collections, from the #56 dump
+
+# --- third family: the older Void headsets (HeadsetControl's "rich" Void, 0x0A55) ---
+# The dongle's battery collection is the vendor page 0xFFC5 on interface 3 (HeadsetControl's
+# RichVoidDevice capability detail). The exchange is short: an output report C9 with the
+# byte 64, and a five-byte input report 64 00 <level> B1 <status>. No session, no framing.
+VOID_VENDOR_PAGE = 0xFFC5
+VOID_USAGE = 0x0001
+VOID_REPORT_ID = 0xC9
+VOID_ASK = 0x64                  # the byte after the report id
+VOID_REPLY_ID = 0x64             # the input report the answer arrives in
+VOID_MARKER = 0xB1               # byte 3 of a battery reply
+VOID_STATUS_OFF = 0              # the receiver has no headset on it
+VOID_CHARGING = (4, 5)           # 1 normal, 2 low, 4/5 charging (HeadsetControl)
+VOID_PIDS = {0x0A55: "Corsair Void Elite Wireless"}
+BRAGI_USAGE = 0x0001             # the one that answers; 0x0002 is its notice channel
+BRAGI_MSG_SIZE = 64              # ckb-next: MSG_SIZE (structures.h)
+BRAGI_ROUTE_DONGLE = 0x08        # the receiver itself
+BRAGI_ROUTE_MOUSE = 0x09         # 0x08 | child 1: the paired mouse
+BRAGI_ROUTE_CHILD = 0x01         # the route the mouse's answers come back with
+BRAGI_CMD_GET = 0x02             # ckb-next: CMD_GET
+BRAGI_PROP_BATTERY = 0x0F        # ckb-next: BRAGI_BATTERY_LEVEL
+BRAGI_PROP_CHARGE = 0x10         # 1 = charging, 2 = on battery (#204, measured)
+BRAGI_PROP_HEARTBEAT = 0x12      # the session heartbeats (#204)
+BRAGI_PROP_FIRMWARE = 0x13       # the session's firmware query (#204)
+BRAGI_LEVEL_MAX = 1000           # tenths of a percent (765 -> 76 %)
+BRAGI_WINDOW_S = 6.0             # the answer measured ~4.7 s after the write (#56); a
+                                 # time window, not a read count - traffic frames end a
+                                 # 500 ms read early and used to eat the old budget
+BRAGI_CONFIRM_WINDOW_S = 3.0     # the confirming ask; the mouse is awake by then
+BRAGI_READ_ATTEMPTS = 96         # a hard stop so a busy channel cannot spin
+BRAGI_POLL_BUDGET_S = 7.0        # total per dongle, across its collections
+
+# The Virtuoso family reads through the bare 64-byte frame with the leading 0x02
+# and reports the charge state on property 0x10: measured on the 0A40 receiver
+# (#204), and the same exchange on the four XT/SE ids from HeadsetControl's
+# reworked device (#570). The Dark Core takes the framed write and reports no
+# charge, so each stays scoped to the ids measured with it.
+BRAGI_BARE_PIDS = {0x0A40, 0x0A3E, 0x0A3D, 0x0A64, 0x0A62}
+# the session was measured on the 0A40 alone; HeadsetControl reads the family's
+# properties without one (#570), so the new ids mirror that
+BRAGI_SESSION_PIDS = {0x0A40}
+# the wired ids resolve their target the other way round: HeadsetControl's
+# resolveTarget tries 0x08 first on a wired id and 0x09 on a receiver, with the
+# other as the fallback (#570)
+BRAGI_WIRED_PIDS = {0x0A3D, 0x0A62}
 
 
-def nxp_request() -> bytes:
-    """The 64-byte nxp packet; hidapi wants the report id (0) in front of it."""
-    payload = bytearray(NXP_MSG_SIZE)
-    payload[0] = NXP_CMD_GET
-    payload[1] = NXP_FIELD_BATTERY
+def bragi_request(prop: int = BRAGI_PROP_BATTERY,
+                  route: int = BRAGI_ROUTE_MOUSE) -> bytes:
+    """The Dark Core's get-property frame: report id 0, the route, cmd, property."""
+    payload = bytearray(BRAGI_MSG_SIZE)
+    payload[0] = route
+    payload[1] = BRAGI_CMD_GET
+    payload[2] = prop
     return b"\x00" + bytes(payload)
 
 
-def parse_nxp(reply) -> Optional[Tuple[int, str]]:
-    """-> (level, label) from a battery reply, or None when it is not one."""
+def bragi_se_request(prop: int = BRAGI_PROP_BATTERY,
+                     route: int = BRAGI_ROUTE_MOUSE) -> bytes:
+    """The Virtuoso SE receiver's get-property frame: `02 <route> 02 <property>`.
+
+    Its data begins with the extra 0x02 (`02 09 02 0f` against the Dark Core's
+    `09 02 0f`), and the whole 64 bytes go out bare - Windows refuses every
+    report-id-prefixed form on this receiver (#204, measured).
+    """
+    head = bytes([0x02, route, BRAGI_CMD_GET, prop])
+    return head + bytes(BRAGI_MSG_SIZE - len(head))
+
+
+def parse_bragi_raw(reply) -> Optional[int]:
+    """The raw 16-bit value of a get-property answer, or None when it is not one.
+
+    Two answer shapes carry it, both routed to `0x01` with command `0x02` and
+    err `0x00`: the Dark Core's `01 02 00 <v LE>` (measured in #56) and the
+    Virtuoso receivers' `01 01 02 00 <v LE>`, whose extra byte is the source
+    (`01` = the headset; probe-measured on the 0A40, #204 - the value sits one
+    byte further along). The dongle sends other frames as well (device-list
+    records on the same channel, notices on its sibling collection, the session
+    heartbeats with values in the thousands), so a frame counts only when every
+    field above matches - one of those frames parsed as a level was the 0 %
+    flash the earlier release showed.
+    """
     if not reply:
         return None
     data = list(reply)
-    if len(data) >= NXP_MSG_SIZE + 1:      # hidapi may hand the report id back
+    if len(data) >= BRAGI_MSG_SIZE + 1:      # hidapi may hand the report id back
         data = data[1:]
-    if len(data) < NXP_STATUS_INDEX + 1:
+    if len(data) < 5 or data[0] != BRAGI_ROUTE_CHILD:
         return None
-    idx = data[NXP_LEVEL_INDEX]
-    if not 0 <= idx < len(NXP_LEVELS):
+    if data[1] == BRAGI_CMD_GET and data[2] == 0x00:            # the Dark Core
+        return data[3] | (data[4] << 8)
+    if (len(data) >= 6 and data[1] == BRAGI_ROUTE_CHILD         # the Virtuoso
+            and data[2] == BRAGI_CMD_GET and data[3] == 0x00):
+        return data[4] | (data[5] << 8)
+    return None
+
+
+def parse_bragi(reply) -> Optional[int]:
+    """The battery level in percent from a get-property answer, or None."""
+    value = parse_bragi_raw(reply)
+    if value is None or value == 0 or value > BRAGI_LEVEL_MAX:
         return None
-    return NXP_LEVELS[idx], f"about {NXP_LEVELS[idx]}%"
+    return value // 10
+
+
+def void_request() -> List[int]:
+    """The battery ask: an output report 0xC9 whose first byte is 0x64."""
+    return [VOID_REPORT_ID, VOID_ASK]
+
+
+def parse_void(reply) -> Optional[Tuple[int, bool]]:
+    """(level, charging) from a Void battery reply, or None.
+
+    The reply is 64 00 <level|mic flag> B1 <status>. A status of 0 means the receiver
+    has no headset on it; 1 and 2 are on-battery (normal and low), 4 and 5 charging.
+    Bit 7 of the level byte is the microphone-lifted flag, not part of the level.
+    """
+    if not reply or len(reply) < 5:
+        return None
+    if reply[0] != VOID_REPLY_ID or reply[3] != VOID_MARKER:
+        return None
+    status = reply[4]
+    if status == VOID_STATUS_OFF:
+        return None
+    level = reply[2] & 0x7F
+    if not 0 <= level <= 100:
+        return None
+    return level, status in VOID_CHARGING
+
+
+def parse_bragi_charge(reply) -> Optional[bool]:
+    """True while charging, False on battery, None when not a charge answer.
+
+    Property 0x10: 1 = charging, 2 = on battery (measured on the Virtuoso SE
+    receiver's headset, #204); anything else is not taken as a state.
+    """
+    value = parse_bragi_raw(reply)
+    if value == 1:
+        return True
+    if value == 2:
+        return False
+    return None
 
 
 def parse_level(r) -> Optional[int]:
@@ -131,6 +452,51 @@ class CorsairProvider(Provider):
     def __init__(self):
         self._diag: List[str] = []
 
+    def _query_hs80_usb(self, infos: List[dict], target: int = HS80_USB_TARGET,
+                         transport_name: str = "USB") -> Optional[int]:
+        """Read battery from the direct USB connection or HS80 wireless receiver."""
+        collections = [d for d in infos
+                      if d.get("interface_number") == HS80_USB_INTERFACE
+                      and d.get("usage_page") == HS80_USB_USAGE_PAGE]
+        collections.sort(key=lambda d: (0 if d.get("usage") == 0x0001 else 1,
+                                        d.get("usage", 0)))
+        if not collections:
+            self._diag.append(f"  HS80 {transport_name}: no interface 3 ff42 collection")
+            return None
+        for d in collections:
+            dev = hid.device()
+            try:
+                dev.open_path(d["path"])
+                self._diag.append(f"  HS80 {transport_name} iface={d.get('interface_number')} "
+                                  f"usage={d.get('usage_page', 0):04x}:{d.get('usage', 0):04x}")
+                # Discard stale reports so they cannot be mistaken for this query.
+                for _ in range(4):
+                    if not dev.read(HS80_USB_REPORT_SIZE, FLUSH_TIMEOUT_MS):
+                        break
+                request = hs80_usb_request(target)
+                written = dev.write(request)
+                if not isinstance(written, int) or written != len(request):
+                    self._diag.append(f"  HS80 {transport_name}: short write ({written!r}/{len(request)})")
+                    continue
+                for attempt in range(HS80_USB_READ_ATTEMPTS):
+                    report = dev.read(HS80_USB_REPORT_SIZE, HS80_USB_READ_TIMEOUT_MS)
+                    if not report:
+                        continue
+                    self._diag.append(f"  HS80 {transport_name} reply {attempt + 1}: {hexdump(report, 12)}")
+                    level = parse_hs80_usb_battery(report, target)
+                    if level is not None:
+                        self._diag.append(f"  HS80 {transport_name} battery: {level}%")
+                        return level
+                self._diag.append(f"  HS80 {transport_name}: no valid battery reply")
+            except (OSError, IOError, ValueError) as e:
+                self._diag.append(f"  HS80 {transport_name} query: {e}")
+            finally:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+        return None
+
     def _pick(self, infos: List[dict]) -> Optional[dict]:
         for d in infos:
             if d.get("interface_number") == CONTROL_INTERFACE:
@@ -139,18 +505,138 @@ class CorsairProvider(Provider):
                           f"falling back to the first of {len(infos)}")
         return infos[0] if infos else None
 
-    def _pick_nxp(self, infos: List[dict]) -> List[dict]:
-        """The dongle's vendor collections, its own iface 1 first; the rest only
-        when the dump's collection is missing (a wrong endpoint then costs one read)."""
-        vend = [d for d in infos if d.get("usage_page") == NXP_USAGE_PAGE]
+    def _pick_bragi(self, infos: List[dict]) -> List[dict]:
+        """The dongle's vendor collections, the one that answers first.
+
+        It has two (0xFF42:0x0001 and 0xFF42:0x0002, from the #56 dump): the
+        exchange answers on usage 0x0001, while 0x0002 is its notice channel and
+        is not asked. When 0xFF42 is missing, the remaining collections are tried,
+        which then costs one read window.
+        """
+        vend = [d for d in infos if d.get("usage_page") == BRAGI_VENDOR_PAGE]
         if not vend:
-            self._diag.append(f"  no {NXP_USAGE_PAGE:04x} collection; trying all "
+            self._diag.append(f"  no {BRAGI_VENDOR_PAGE:04x} collection; trying all "
                               f"{len(infos)}")
             vend = list(infos)
-        return sorted(vend, key=lambda d: (0 if d.get("usage") == 0x0001 else 1,
+        return sorted(vend, key=lambda d: (0 if d.get("usage") == BRAGI_USAGE else 1,
                                            d.get("interface_number") or 99))
 
-    def _query_nxp(self, path: bytes) -> Optional[List[int]]:
+    def _ask_bragi(self, dev, window: float, parse=parse_bragi) -> Optional[int]:
+        """One ask's answer within a time window; the parsed value, or None."""
+        deadline = time.monotonic() + window
+        for _ in range(BRAGI_READ_ATTEMPTS):
+            if time.monotonic() >= deadline:
+                return None
+            r = dev.read(BRAGI_MSG_SIZE + 1, READ_TIMEOUT_MS)
+            if not r:
+                continue
+            self._diag.append(f"  reply: {hexdump(r)}")
+            value = parse(r)
+            if value is not None:
+                return value
+        return None
+
+    def _write_bragi(self, dev, prop: int = BRAGI_PROP_BATTERY,
+                     route: int = BRAGI_ROUTE_MOUSE, pid: int = 0x1B7F) -> bool:
+        """Send a get-property ask in the framing the receiver takes.
+
+        The Dark Core's dongle takes the 65-byte report-id-0 frame (confirmed on
+        hardware), with the bare form as a fallback; the Virtuoso SE receiver
+        refuses every report-id-prefixed form with Windows' 0x57 and takes its
+        own bare 64-byte frame, extra leading 0x02 included (#204, measured).
+        """
+        if pid in BRAGI_BARE_PIDS:
+            forms = [bragi_se_request(prop, route)]
+        else:
+            req = bragi_request(prop, route)
+            forms = [req, req[1:]]
+        framed = True
+        for buf in forms:
+            try:
+                wrote = dev.write(buf)
+            except (OSError, IOError, ValueError) as e:
+                self._diag.append(f"  write: {e}")
+                wrote = None
+            if isinstance(wrote, int) and wrote > 0:
+                if not framed:
+                    self._diag.append("  (the framed write was refused; "
+                                      "the bare form took it)")
+                return True
+            framed = False
+        self._diag.append(f"  prop {prop:02x}: the write was refused")
+        return False
+
+    def _read_window(self, dev, window: float, label: str) -> None:
+        """Read and log whatever arrives in a short window (session replies)."""
+        deadline = time.monotonic() + window
+        for _ in range(BRAGI_READ_ATTEMPTS):
+            if time.monotonic() >= deadline:
+                return
+            try:
+                r = dev.read(BRAGI_MSG_SIZE + 1, READ_TIMEOUT_MS)
+            except (OSError, IOError, ValueError):
+                return
+            if r:
+                self._diag.append(f"  {label}: {hexdump(r)}")
+
+    def _bragi_session(self, dev, deadline: float, pid: int) -> None:
+        """The session the SE receiver was measured with (#204): firmware query,
+        receiver heartbeat (route 0x08), headset heartbeat (route 0x09)."""
+        for prop, route, label in ((BRAGI_PROP_FIRMWARE, BRAGI_ROUTE_DONGLE,
+                                    "firmware query"),
+                                   (BRAGI_PROP_HEARTBEAT, BRAGI_ROUTE_DONGLE,
+                                    "receiver heartbeat"),
+                                   (BRAGI_PROP_HEARTBEAT, BRAGI_ROUTE_MOUSE,
+                                    "headset heartbeat")):
+            if time.monotonic() >= deadline:
+                return
+            if not self._write_bragi(dev, prop, route, pid):
+                self._diag.append(f"  {label}: not sent")
+                return
+            self._read_window(dev, min(0.8, max(0.0, deadline - time.monotonic())), label)
+
+    @staticmethod
+    def _routes(pid: int) -> Tuple[int, ...]:
+        """The target order for a pid: the wired ids try themselves first (HSC #570)."""
+        if pid in BRAGI_WIRED_PIDS:
+            return (BRAGI_ROUTE_DONGLE, BRAGI_ROUTE_MOUSE)
+        if pid in (0x0A3E, 0x0A64):
+            return (BRAGI_ROUTE_MOUSE, BRAGI_ROUTE_DONGLE)
+        return (BRAGI_ROUTE_MOUSE,)
+
+    def _bragi_charge(self, dev, deadline: float, pid: int,
+                      route: int = BRAGI_ROUTE_MOUSE) -> Optional[bool]:
+        """The charge state on the receivers that report one (property 0x10),
+        or None."""
+        if pid not in BRAGI_BARE_PIDS or time.monotonic() >= deadline:
+            return None
+        if not self._write_bragi(dev, BRAGI_PROP_CHARGE, route=route, pid=pid):
+            return None
+        value = self._ask_bragi(dev, min(BRAGI_CONFIRM_WINDOW_S,
+                                         deadline - time.monotonic()),
+                                parse=parse_bragi_charge)
+        if value is None:
+            self._diag.append("  no charge-state answer")
+            return None
+        self._diag.append("  charge state: " + ("charging" if value else "on battery"))
+        return bool(value)
+
+    def _query_bragi(self, path: bytes, deadline: float,
+                     pid: int) -> Optional[Tuple[int, Optional[bool]]]:
+        """One battery question to the dongle; (level, charging or None), or None.
+
+        The answer arrives late - measured ~4.7 s on the reporter's dongle with
+        the mouse resting (#56) - so the wait is a time window (review by
+        @ahmedkhursheed23: traffic frames end a 500 ms read early and used to
+        eat a read-count budget). The answer does not echo which property it
+        answers, and Windows delivers input reports to every open handle, so a
+        second app polling the same dongle could put a foreign answer on the
+        channel that parses as a level - the ask is repeated and the two answers
+        must agree (a confirming ask that stays silent is noted and the single
+        reading taken; a disagreement is refused rather than shown). The SE
+        receivers run the measured session first and answer the charge property
+        after the level (#204).
+        """
         dev = hid.device()
         try:
             dev.open_path(path)
@@ -158,13 +644,37 @@ class CorsairProvider(Provider):
             self._diag.append(f"  open: {e}")
             return None
         try:
-            dev.write(nxp_request())
-            r = dev.read(NXP_MSG_SIZE + 1, READ_TIMEOUT_MS)
-            if not r:
-                self._diag.append("  no reply")
+            self._drain(dev)
+            if pid in BRAGI_SESSION_PIDS:
+                self._bragi_session(dev, deadline, pid)
+            routes = self._routes(pid)
+            first = None
+            route = routes[0]
+            for i, route in enumerate(routes):
+                if not self._write_bragi(dev, route=route, pid=pid):
+                    return None
+                first = self._ask_bragi(dev, min(BRAGI_WINDOW_S,
+                                                 deadline - time.monotonic()))
+                if first is not None:
+                    break
+                if i + 1 < len(routes):
+                    self._diag.append(f"  no answer on target {route:02x}; "
+                                      "trying the other")
+            if first is None:
+                self._diag.append("  no battery answer")
                 return None
-            self._diag.append(f"  reply: {hexdump(r)}")
-            return list(r)
+            if not self._write_bragi(dev, route=route, pid=pid):
+                return None
+            second = self._ask_bragi(dev, min(BRAGI_CONFIRM_WINDOW_S,
+                                              deadline - time.monotonic()))
+            if second is None:
+                self._diag.append("  (the confirming ask stayed silent; taking the "
+                                  "single reading)")
+            elif second != first:
+                self._diag.append(f"  the two answers disagree ({first} % / {second} %) - "
+                                  f"refused")
+                return None
+            return first, self._bragi_charge(dev, deadline, pid, route)
         except (OSError, IOError, ValueError) as e:
             self._diag.append(f"  query error: {e}")
             return None
@@ -174,15 +684,173 @@ class CorsairProvider(Provider):
             except Exception:
                 pass
 
-    def _write(self, dev, endpoint: int, sub: int, command: int) -> bool:
-        dev.write(make_request(endpoint, sub, command))
-        return True
+    def _write(self, dev, endpoint: int, sub: int, command: int) -> int:
+        return self._write_frame(dev, make_request(endpoint, sub, command),
+                                 f"{endpoint:02x}/{sub:02x}/{command:02x}")
 
-    def _drain(self, dev) -> None:
+    def _write_frame(self, dev, frame, label: str) -> int:
+        """One write, in the shape this family's receiver accepts on Windows.
+
+        Windows refuses a write whose length is not exactly the collection's
+        OutputReportByteLength (STATUS_INVALID_PARAMETER, 0x57) before it ever
+        reaches the device - headsetcontrol#521's wall, and #28's, where every
+        65-byte write came back -1. The reporter's probe logs show the shape
+        that is accepted: 64 bytes with no leading report id. The two shapes
+        cannot both be accepted on one collection, so the fallback picks the
+        right one by itself.
+        """
+        n = dev.write(frame[1:])          # 64 bytes: no leading report id
+        if isinstance(n, int) and n < 0:
+            n = dev.write(frame)          # 65 bytes: the old rid-prefixed form
+        if in_probe():
+            self._diag.append(f"  [w] {label} -> {n}{_error_note(dev, n)}")
+        return n
+
+    def _drain(self, dev, label: str = "") -> None:
         """Drop replies that are still queued, so the next read is ours."""
         for _ in range(4):
-            if not dev.read(MSG_SIZE_READ, FLUSH_TIMEOUT_MS):
+            r = dev.read(MSG_SIZE_READ, FLUSH_TIMEOUT_MS)
+            if not r:
                 return
+            if in_probe():
+                self._diag.append(f"  [drain{label}] {hexdump(r, MSG_SIZE_READ)}")
+
+    def _listen(self, dev) -> None:
+        """Probe only: read whatever arrives, without writing anything.
+
+        With the vendor app open this catches the vendor's own exchange with the
+        headset - the ground truth for what a working answer looks like.
+        """
+        self._diag.append(f"  listening {PROBE_LISTEN_MS // 1000} s without writing anything")
+        t0 = time.monotonic()
+        while (time.monotonic() - t0) * 1000 < PROBE_LISTEN_MS:
+            r = dev.read(MSG_SIZE_READ, 250)
+            if r:
+                ms = (time.monotonic() - t0) * 1000
+                self._diag.append(f"  [{ms / 1000:6.2f}s] {hexdump(r, MSG_SIZE_READ)}")
+
+    def _probe_fallback(self, dev) -> Optional[List[int]]:
+        """Probe only: what is left to try when the usual sequence yields nothing.
+
+        The vendor app's Connect() takes the fuller path - software mode on the
+        receiver and the headset first - and the desktop software may leave the
+        device in a state only that path talks to. The headset can pop audibly
+        when the mode changes; that is expected in this run.
+        """
+        self._diag.append("  probe: trying the vendor app's fuller sequence "
+                          "(software mode; the headset may pop)")
+        try:
+            self._write(dev, RECEIVER_ENDPOINT, FW_SUB, CMD_FIRMWARE)
+            self._write_frame(dev, make_software_mode(RECEIVER_ENDPOINT), "08|01/03/00/02")
+            self._write(dev, RECEIVER_ENDPOINT, HB_SUB, CMD_HEARTBEAT)
+            self._write_frame(dev, make_software_mode(HEADSET_ENDPOINT), "09|01/03/00/02")
+            self._drain(dev)
+            self._write(dev, HEADSET_ENDPOINT, HB_SUB, CMD_HEARTBEAT)
+            t0 = time.monotonic()
+            r = dev.read(MSG_SIZE_READ, PROBE_HB_TIMEOUT_MS)
+            if r:
+                self._diag.append(f"  probe: heartbeat answered "
+                                  f"({(time.monotonic() - t0) * 1000:.0f} ms): "
+                                  f"{hexdump(r, MSG_SIZE_READ)}")
+            else:
+                self._diag.append("  probe: no heartbeat after software mode either")
+            for i, timeout in enumerate(PROBE_SOFTWARE_TIMEOUT_MS):
+                self._write(dev, HEADSET_ENDPOINT, BATTERY_SUB, CMD_BATTERY)
+                t0 = time.monotonic()
+                r = dev.read(MSG_SIZE_READ, timeout)
+                if not r:
+                    self._diag.append(f"  probe: attempt {i + 1}: no reply after {timeout} ms")
+                    continue
+                self._diag.append(f"  probe: attempt {i + 1} reply "
+                                  f"({(time.monotonic() - t0) * 1000:.0f} ms): "
+                                  f"{hexdump(r, MSG_SIZE_READ)}")
+                if parse_level(r) is not None:
+                    return list(r)
+        except (OSError, IOError, ValueError) as e:
+            self._diag.append(f"  probe: error in the fuller sequence: {e}")
+        return None
+
+    def _probe_caps(self, infos: List[dict]) -> Dict[bytes, Optional[Tuple[int, int, int]]]:
+        """Probe only: what every collection of this receiver declares.
+
+        #28's logs showed every write refused with -1 before it could reach the
+        dongle - a refusal this layer makes locally, indistinguishable from a
+        silent device until the caps are on the table.
+        """
+        caps_by_path = {}
+        for d in infos:
+            path = d.get("path")
+            caps = caps_for(path)
+            caps_by_path[path] = caps
+            shown = "?" if caps is None else f"in/out/feat={caps[0]}/{caps[1]}/{caps[2]}"
+            self._diag.append(f"  caps: iface={d.get('interface_number')} "
+                              f"{d.get('usage_page', 0):04x}:{d.get('usage', 0):04x} {shown}")
+        return caps_by_path
+
+    def _probe_matrix(self, infos: List[dict],
+                      caps_by_path: Dict[bytes, Optional[Tuple[int, int, int]]]) -> None:
+        """Probe only: try the battery frame in each framing, on every collection.
+
+        The first collection that takes a write is reused for one more ask, so the
+        next build can start from it. A write Windows refuses never reaches the
+        dongle, which is the state #28's logs were stuck in.
+        """
+        self._diag.append("  probe: write shapes, collection by collection")
+        order = sorted(infos,
+                       key=lambda d: (0 if d.get("interface_number") == CONTROL_INTERFACE else 1,
+                                      0 if (d.get("usage_page") or 0) >= 0xFF00 else 1))
+        frame = make_request(HEADSET_ENDPOINT, BATTERY_SUB, CMD_BATTERY)
+        for d in order:
+            key = d.get("path")
+            key = bytes(key) if isinstance(key, (bytes, bytearray)) else None
+            caps = caps_by_path.get(key) if key is not None else None
+            where = (f"iface={d.get('interface_number')} "
+                     f"{d.get('usage_page', 0):04x}:{d.get('usage', 0):04x}")
+            shapes = [("write65-rid0", frame), ("write64-norid", frame[1:])]
+            if caps and caps[1] and caps[1] != len(frame):
+                shapes.append((f"write{caps[1]}-rid0", (frame + [0x00] * caps[1])[:caps[1]]))
+            dev = hid.device()
+            try:
+                dev.open_path(d.get("path"))
+            except (OSError, IOError) as e:
+                self._diag.append(f"  probe: open {where}: {e}")
+                continue
+            try:
+                accepted = False
+                accepted_buf = None
+                for label, buf in shapes:
+                    try:
+                        n = dev.write(bytes(buf))
+                    except (OSError, IOError, ValueError) as e:
+                        n, note = -1, f" ({e})"
+                    else:
+                        note = _error_note(dev, n)
+                    self._diag.append(f"  probe: {label} {where} -> {n}{note}")
+                    if isinstance(n, int) and n >= 0:
+                        accepted = True
+                        accepted_buf = bytes(buf)
+                        break
+                if not accepted:
+                    continue
+                t0 = time.monotonic()
+                r = dev.read(MSG_SIZE_READ, PROBE_HB_TIMEOUT_MS)
+                self._diag.append(f"  probe: first answer "
+                                  f"({(time.monotonic() - t0) * 1000:.0f} ms): "
+                                  f"{hexdump(r, MSG_SIZE_READ) if r else 'none'}")
+                n2 = dev.write(accepted_buf)
+                self._diag.append(f"  probe: re-ask -> {n2}{_error_note(dev, n2)}")
+                t0 = time.monotonic()
+                r = dev.read(MSG_SIZE_READ, PROBE_HB_TIMEOUT_MS)
+                self._diag.append(f"  probe: ask again "
+                                  f"({(time.monotonic() - t0) * 1000:.0f} ms): "
+                                  f"{hexdump(r, MSG_SIZE_READ) if r else 'none'}")
+                self._diag.append("  probe: this collection takes the write - build on it")
+                break
+            finally:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
 
     def _query(self, path: bytes) -> Optional[List[int]]:
         dev = hid.device()
@@ -192,27 +860,101 @@ class CorsairProvider(Provider):
             self._diag.append(f"  open: {e}")
             return None
         try:
+            if in_probe():
+                self._listen(dev)
+
             # The handshake that wakes a sleeping headset without an audible pop.
             self._write(dev, RECEIVER_ENDPOINT, FW_SUB, CMD_FIRMWARE)
             self._write(dev, RECEIVER_ENDPOINT, HB_SUB, CMD_HEARTBEAT)
             self._drain(dev)
-            self._write(dev, HEADSET_ENDPOINT, HB_SUB, CMD_HEARTBEAT)
-            if not dev.read(MSG_SIZE_READ, READ_TIMEOUT_MS):
-                self._diag.append("  headset heartbeat: no reply "
-                                  "(headset off or asleep)")
+            hb_n = self._write(dev, HEADSET_ENDPOINT, HB_SUB, CMD_HEARTBEAT)
+            hb_timeout = PROBE_HB_TIMEOUT_MS if in_probe() else READ_TIMEOUT_MS
+            t0 = time.monotonic()
+            hb = dev.read(MSG_SIZE_READ, hb_timeout)
+            if not hb:
+                if isinstance(hb_n, int) and hb_n < 0:
+                    self._diag.append("  headset heartbeat: the write was refused "
+                                      "before it left (nothing was sent)")
+                elif in_probe():
+                    self._diag.append(f"  headset heartbeat: no reply after "
+                                      f"{hb_timeout} ms (headset off or asleep)")
+                else:
+                    self._diag.append("  headset heartbeat: no reply "
+                                      "(headset off or asleep)")
+                if in_probe():
+                    return self._probe_fallback(dev)
                 return None
+            if in_probe():
+                self._diag.append(f"  headset heartbeat answered "
+                                  f"({(time.monotonic() - t0) * 1000:.0f} ms): "
+                                  f"{hexdump(hb, MSG_SIZE_READ)}")
             self._drain(dev)
 
             for attempt in range(ATTEMPTS):
                 self._write(dev, HEADSET_ENDPOINT, BATTERY_SUB, CMD_BATTERY)
-                r = dev.read(MSG_SIZE_READ, READ_TIMEOUT_MS)
+                if in_probe():
+                    timeout = PROBE_ATTEMPT_TIMEOUT_MS[min(attempt, len(PROBE_ATTEMPT_TIMEOUT_MS) - 1)]
+                else:
+                    timeout = READ_TIMEOUT_MS
+                t0 = time.monotonic()
+                r = dev.read(MSG_SIZE_READ, timeout)
                 if not r:
-                    self._diag.append(f"  attempt {attempt + 1}: no reply")
+                    if in_probe():
+                        self._diag.append(f"  attempt {attempt + 1}: no reply after {timeout} ms")
+                    else:
+                        self._diag.append(f"  attempt {attempt + 1}: no reply")
                     continue
-                self._diag.append(f"  attempt {attempt + 1} reply: {hexdump(r)}")
+                if in_probe():
+                    self._diag.append(f"  attempt {attempt + 1} reply "
+                                      f"({(time.monotonic() - t0) * 1000:.0f} ms): "
+                                      f"{hexdump(r, MSG_SIZE_READ)}")
+                else:
+                    self._diag.append(f"  attempt {attempt + 1} reply: {hexdump(r)}")
                 if parse_level(r) is not None:
                     return list(r)
+                if in_probe():
+                    self._drain(dev, " between attempts")
             self._diag.append("  no usable level in the replies")
+            if in_probe():
+                return self._probe_fallback(dev)
+            return None
+        except (OSError, IOError, ValueError) as e:
+            self._diag.append(f"  query error: {e}")
+            return None
+        finally:
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+    def _query_void(self, path: bytes) -> Optional[Tuple[int, bool]]:
+        """The older Void exchange: write C9 64, read 64 00 <level> B1 <status>."""
+        dev = hid.device()
+        try:
+            dev.open_path(path)
+        except (OSError, IOError) as e:
+            self._diag.append(f"  open: {e}")
+            return None
+        try:
+            # HeadsetControl writes the two bytes as they are; on Windows a short write
+            # is refused when the descriptor's output report is longer, so the padded
+            # form is tried after it. Both carry the same command.
+            for form in (void_request(), void_request() + [0] * (MSG_SIZE_WRITE - 2)):
+                try:
+                    n = dev.write(form)
+                except (OSError, IOError, ValueError) as e:
+                    self._diag.append(f"  write ({len(form)} bytes): {e}")
+                    continue
+                self._diag.append(f"  [w] ({len(form)} bytes) -> {n}")
+                for _ in range(ATTEMPTS):
+                    r = dev.read(MSG_SIZE_READ, READ_TIMEOUT_MS)
+                    if not r:
+                        break
+                    self._diag.append(f"  reply: {hexdump(r, 6)}")
+                    got = parse_void(r)
+                    if got is not None:
+                        return got
+            self._diag.append("  no battery answer")
             return None
         except (OSError, IOError, ValueError) as e:
             self._diag.append(f"  query error: {e}")
@@ -232,6 +974,34 @@ class CorsairProvider(Provider):
             return []
         out = []
         seen = set()
+        hs80_usb = [d for d in infos if d.get("product_id") == HS80_USB_PID]
+        hs80_cable_present = any(d.get("product_id") in
+                                 (HS80_USB_PID, HS80_CHARGING_CABLE_PID) for d in infos)
+        hs80_found = False
+        if hs80_usb:
+            self._diag.append("[Corsair HS80 USB] original HS80 RGB Wireless, direct USB")
+            level = self._query_hs80_usb(hs80_usb)
+            if level is not None:
+                # The 0a69 identity is the powered-on direct USB mode; the
+                # protocol exposes no charge flag, so cable presence signals charging.
+                out.append(DeviceStatus("corsair:hs80", "Corsair HS80 RGB Wireless",
+                                        level, True, True, "corsair", kind="headset"))
+                hs80_found = True
+        hs80_receiver = [d for d in infos if d.get("product_id") == 0x0A6B]
+        if hs80_receiver and not hs80_found:
+            self._diag.append("[Corsair HS80 receiver] original HS80 RGB Wireless, wireless")
+            level = self._query_hs80_usb(hs80_receiver, target=0x09,
+                                         transport_name="wireless")
+            if level is not None:
+                out.append(DeviceStatus("corsair:hs80", "Corsair HS80 RGB Wireless",
+                                        level, hs80_cable_present, True, "corsair", kind="headset"))
+                hs80_found = True
+        if hs80_cable_present and not hs80_found:
+            # With the headset switched off, USB enumerates as 0a6a and exposes
+            # no battery control collection. Keep the device visible and animate
+            # charging; the charge percentage is unavailable in this state.
+            out.append(DeviceStatus("corsair:hs80", "Corsair HS80 RGB Wireless",
+                                    None, True, True, "corsair", kind="headset"))
         for pid in PIDS:
             mine = [d for d in infos if d["product_id"] == pid and d["path"] not in seen]
             if not mine:
@@ -244,27 +1014,67 @@ class CorsairProvider(Provider):
             self._diag.append(f"[Corsair] pid={pid:04x} '{name}' "
                               f"iface={d.get('interface_number')} "
                               f"{d.get('usage_page', 0):04x}:{d.get('usage', 0):04x}")
+            caps_by_path: Dict[bytes, Optional[Tuple[int, int, int]]] = {}
+            if in_probe():
+                self._diag.append(f"  path: {d.get('path', b'')!r}")
+                caps_by_path = self._probe_caps(mine)
             reply = self._query(d["path"])
+            if reply is None and in_probe():
+                self._probe_matrix(mine, caps_by_path)
             level = parse_level(reply)
             if level is None:
                 continue
             out.append(DeviceStatus(f"corsair:{pid:04x}", name, level, False, True,
                                     "corsair", kind="headset"))
-        for pid, name in NXP_PIDS.items():
+        found: Dict[str, Tuple[int, bool, str, str]] = {}
+        for pid, name in BRAGI_PIDS.items():
             mine = [d for d in infos if d["product_id"] == pid and d["path"] not in seen]
             if not mine:
                 continue
-            self._diag.append(f"[Corsair nxp] pid={pid:04x} '{name}'")
-            for d in self._pick_nxp(mine):
+            self._diag.append(f"[Corsair bragi] pid={pid:04x} '{name}'")
+            deadline = time.monotonic() + BRAGI_POLL_BUDGET_S
+            for d in self._pick_bragi(mine):
+                if time.monotonic() >= deadline:
+                    self._diag.append("  (the read budget is spent; the remaining "
+                                      "collections are skipped)")
+                    break
                 self._diag.append(f"  iface={d.get('interface_number')} "
                                   f"usage={d.get('usage_page', 0):04x}:{d.get('usage', 0):04x}")
                 seen.add(d["path"])
-                parsed = parse_nxp(self._query_nxp(d["path"]))
-                if parsed is None:
+                got = self._query_bragi(d["path"], deadline, pid)
+                if got is None:
                     continue
-                level, label = parsed
-                out.append(DeviceStatus(f"corsair:{pid:04x}", name, level, False, True,
-                                        "corsair", approx=label, kind="mouse"))
+                level, charging = got
+                key = BRAGI_KEYS[pid]
+                kind = BRAGI_KINDS.get(pid, "headset")
+                kept = found.get(key)
+                # a receiver and a cable of one headset are one icon; when both
+                # answer, the one that reports charging wins (the cable state)
+                if kept is None or (charging and not kept[1]):
+                    found[key] = (level, bool(charging), name, kind)
+                break
+        for key, (level, charging, name, kind) in found.items():
+            out.append(DeviceStatus(key, name, level, charging, True, "corsair",
+                                    kind=kind))
+        for pid, name in VOID_PIDS.items():
+            mine = [d for d in infos if d["product_id"] == pid and d["path"] not in seen]
+            if not mine:
+                continue
+            vend = [d for d in mine if d.get("usage_page") == VOID_VENDOR_PAGE]
+            self._diag.append(f"[Corsair void] pid={pid:04x} '{name}'"
+                              + ("" if vend else f" (no {VOID_VENDOR_PAGE:04x} collection)"))
+            for d in sorted(vend or mine,
+                            key=lambda x: (0 if x.get("usage") == VOID_USAGE else 1,
+                                           x.get("interface_number") or 0)):
+                self._diag.append(f"  iface={d.get('interface_number')} "
+                                  f"usage={d.get('usage_page', 0):04x}:{d.get('usage', 0):04x}")
+                seen.add(d["path"])
+                got = self._query_void(d["path"])
+                if got is None:
+                    continue
+                level, charging = got
+                out.append(DeviceStatus(f"corsair:void:{pid:04x}", name, level,
+                                        charging, True, "corsair", kind="headset"))
                 break
         return out
 

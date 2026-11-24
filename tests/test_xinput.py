@@ -12,9 +12,11 @@ Run from the repository root:
 import importlib.util
 import os
 import sys
-import tempfile
 import types
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ helpers
+import _sandbox  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -27,7 +29,7 @@ from providers import xinput as X  # noqa: E402
 def load_app():
     """halo_battery.pyw, with its log and settings in a temporary folder."""
     real = os.environ.get("APPDATA")
-    os.environ["APPDATA"] = tempfile.mkdtemp(prefix="halo_battery_test_")
+    os.environ["APPDATA"] = _sandbox.mkdtemp(prefix="halo_battery_test_")
     try:
         spec = importlib.util.spec_from_file_location("halo_battery_xinput",
                                                       os.path.join(ROOT, "halo_battery.pyw"))
@@ -99,7 +101,20 @@ class XboxBluetoothTest(ProviderTest):
     def test_every_bluetooth_id(self):
         for pid in X.XBOX_BLUETOOTH_PIDS:
             _, res = self.poll({0: (X.TYPE_NIMH, 3)}, [wgi_report(0x045E, pid, 820, 1000)])
-            self.assertEqual([(r.level, r.via) for r in res], [(None, "bluetooth")], hex(pid))
+            # not Windows.Gaming.Input's 82%: XInput's coarse "full" level (#236)
+            self.assertEqual([(r.level, r.via) for r in res], [(100, "bluetooth")], hex(pid))
+
+    def test_issue_236_coarse_level_when_windows_has_no_bluetooth_reading(self):
+        # Xbox One S (045e:02e0) on AA cells: Windows.Gaming.Input jumps between 10, 70 and
+        # 100 %, the Bluetooth reading finds nothing, XInput says alkaline / medium
+        hb = load_app()
+        _, res = self.poll({0: (X.TYPE_ALKALINE, 2)}, [wgi_report(0x045E, 0x02E0, 100, 1000)])
+        self.assertEqual([(r.level, r.via) for r in res], [(55, "bluetooth")])
+        self.assertIn("over Bluetooth", res[0].approx)
+        self.assertEqual(hb.dedupe_controllers(res, []), res)
+        bt = [hb.DeviceStatus("bt:x", "Xbox Wireless Controller", 82, False, True, "bluetooth",
+                              kind="gamepad")]
+        self.assertEqual(hb.dedupe_controllers(res, bt), [])          # Windows' value wins
 
     def test_usb_and_adapter_ids_keep_their_level(self):
         # Xbox One S / Series X|S / Elite 2 on USB or the Xbox Wireless Adapter

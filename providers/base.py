@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 log = logging.getLogger("halo_battery")
@@ -21,6 +21,18 @@ class DeviceStatus:
     kind: str = ""               # headset / mouse / keyboard / gamepad when known
                                  # (picks the pictogram); "" = guess from the source
     via: str = ""                # "bluetooth": a controller connected over Bluetooth
+    wake_on_input: bool = False  # True: a greyed reading that new input can refresh (a
+                                 # sleeping receiver mouse wakes on movement). The
+                                 # tray's input wake fires only for these - an icon
+                                 # greyed because its device is off must not re-poll
+                                 # the app on every keystroke (review, #202).
+    charging_known: bool = True  # False: level valid, charger query unavailable; suppress alerts
+
+    polling_paused: bool = False  # cached by choice; explain in menu, keep normal icon
+
+    # Presentation metadata; English approx remains available to diagnostics.
+    ui_message: str = ""
+    ui_params: dict = field(default_factory=dict)
     extra: str = ""              # added to the tooltip, e.g. "spare battery 80%"
 
 

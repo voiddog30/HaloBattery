@@ -16,7 +16,10 @@ talks to the dongle over WebHID:
   * the settings writes captured by johnklucinec/ulx_reverse (04 03 92 01 01 ... for
     motion sync) have the same framing
 Battery status is asked first. The voltage is the fallback for firmware that does not
-answer it, and a state of charge above 100 is refused, as XPanel does.
+answer it, and a state of charge above 100 is refused, as XPanel does. The fallback is
+not theoretical: the ULX dongle this was tested on (firmware behind product string
+'UltralightX dongle', 361D:0100) never answers command 38, and every reading comes from
+the voltage curve.
 
 The mouse on its USB cable (361D:0102) only takes firmware updates: XPanel reads it
 through the dongle, and so does this provider.
@@ -190,11 +193,15 @@ class FinalmouseProvider(Provider):
             if linked is False:
                 self._diag.append("  the mouse is not connected to the dongle (off or asleep)")
             # the dongle cannot tell a switched-off mouse from one that is asleep:
-            # keep the last level, greyed out, for a while
+            # keep the last level, greyed out, for a while. wake_on_input: a sleeping
+            # mouse is awake by the time its first movement lands, so the tray may poll
+            # at once instead of waiting out the interval. The gate #202 warned about
+            # stays narrow here - unlike a receiver that keeps its greyed icon for as
+            # long as it is plugged in, this one expires after ASLEEP_KEEP.
             last = self._last.get(key)
             if last and time.time() - last[2] < ASLEEP_KEEP:
                 out.append(DeviceStatus(key, name, last[0], last[1], False, "finalmouse",
-                                        kind="mouse"))
+                                        kind="mouse", wake_on_input=True))
         return out
 
     def diagnostics(self) -> List[str]:
