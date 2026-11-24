@@ -22,16 +22,28 @@ from providers import logitech as L  # noqa: E402
 class FakeHidpp:
     """One HID++ 2.0 device in a slot.
 
-    features: {feature id: (feature index, {function: reply params or "error"})}
-    error:    an error code that the receiver sends for every request (08, 09, 01 ...)
-    silent:   the device does not answer at all (asleep)
+    features:  {feature id: (feature index, {function: reply params or "error"})}
+    registers: {register: reply params list, or "error"} for HID++ 1.0 reads
+    error:     an error code that the receiver sends for every request (08, 09, 01 ...)
+    silent:    the device does not answer at all (asleep)
     """
 
-    def __init__(self, features=None, name=None, error=None, silent=False):
+    def __init__(self, features=None, name=None, error=None, silent=False, registers=None,
+                 register_error_form=0x8F, register_noise=None, headset_registers=None,
+                 headset_only=False):
         self.features = features or {}
+        # a long-only HID++ 1.0 headset: 11 <idx> 05 <reg> in, 10 <idx> 05 <reg> ... out
+        self.headset_registers = headset_registers
+        self.headset_only = headset_only
         self.name = name
         self.error = error
         self.silent = silent
+        self.registers = registers
+        # a HID++ 2.0 device answers a register read with the 2.0 error form (FF)
+        self.register_error_form = register_error_form
+        # frames another app's register read puts on the channel, queued before
+        # each register answer (they are followed by this device's own reply)
+        self.register_noise = register_noise
 
 
 class FakeBus:
@@ -42,6 +54,7 @@ class FakeBus:
         self.short_of = {p: sh for p, (_, sh) in paths.items()}
         self.queues = {}
         self.writes = []            # (path, bytes) of every write
+        self.reads = 0
         # if set: before each "find feature" reply, a late reply to the PREVIOUS
         # request arrives first (it carries that request's swid)
         self.late_replies = False
@@ -62,6 +75,7 @@ class FakeBus:
                 pass
 
             def read(self, n, timeout=None):
+                bus.reads += 1
                 q = bus.queues.get(self.path, [])
                 return q.pop(0) if q else []
 
@@ -81,10 +95,50 @@ class FakeBus:
         else:
             self.queues[path].append([0x11, idx, 0xFF, feat, fn, code] + [0] * 14)
 
+    def _register_reply(self, path, idx, reg, params):
+        short = self.short_of.get(path) or path
+        if len(params) <= 3:            # register replies are short by default
+            self.queues.setdefault(short, []).append(
+                [0x10, idx, 0x81, reg] + list(params) + [0] * (3 - len(params)))
+        else:                           # more data comes back as a long reply
+            self.queues.setdefault(path, []).append(
+                [0x11, idx, 0x81, reg] + list(params) + [0] * (16 - len(params)))
+
+    def _register_error(self, path, idx, reg, code, form=0x8F):
+        short = self.short_of.get(path) or path
+        self.queues.setdefault(short, []).append([0x10, idx, form, 0x81, reg, code, 0])
+
     def write(self, path, data):
         self.writes.append((path, data))
-        if path not in self.slots:
+        owner = next((lp for lp, sp in self.short_of.items() if sp == path), path)
+        if owner not in self.slots:
             return
+        if len(data) >= 4 and data[2] == 0x05:      # possibly a headset register read
+            dev0 = self.slots.get(owner, {}).get(data[1])
+            if dev0 is not None and dev0.headset_only:
+                if dev0.silent:
+                    return
+                regs = dev0.headset_registers or {}
+                if regs.get(data[3]) is None:       # stays unanswered
+                    return
+                self.queues.setdefault(owner, []).append(
+                    [0x10, data[1], 0x05, data[3]] + list(regs[data[3]]))
+                return
+            # otherwise 0x05 is a feature index: fall through to the 2.0 path
+        if len(data) >= 4 and data[2] == 0x81:      # a HID++ 1.0 register read
+            idx, reg = data[1], data[3]
+            dev = self.slots[owner].get(idx)
+            if dev is None:
+                return self._register_error(owner, idx, reg, L.ERR_EMPTY_SLOT)
+            if dev.silent:
+                return
+            if dev.register_noise:
+                self.queues.setdefault(self.short_of.get(owner) or owner, []).extend(
+                    [list(f) for f in dev.register_noise])
+            regs = dev.registers or {}
+            if regs.get(reg, "error") == "error":
+                return self._register_error(owner, idx, reg, 0x02, dev.register_error_form)
+            return self._register_reply(owner, idx, reg, regs[reg])
         idx, feat, fn = data[1], data[2], data[3]
         prev, self.prev_swid = self.prev_swid, fn & 0x0F
         if self.late_replies and feat == 0 and fn >> 4 == 0 and prev is not None:
@@ -126,11 +180,12 @@ def receiver(pid=0xC539, product="USB Receiver"):
 
 
 VOLTAGE_76 = {L.F_VOLTAGE: (6, {0: [0x0F, 0x7B, 0x00]})}           # 3963 mV -> 76 %
+CHARGING_100 = {L.F_VOLTAGE: (6, {0: [0x10, 0x6C, 0x80]})}         # G502 on its cable
 
 
-def g502():
-    return FakeHidpp({**VOLTAGE_76, L.F_NAME: (3, {2: [3]}),
-                      L.F_INFO: (2, {0: [3, 0xC1, 0x5E, 0x09, 0xCD]})}, name="G502 LIGHTSPEED")
+def g502(battery=VOLTAGE_76, unit=(0xC1, 0x5E, 0x09, 0xCD)):
+    return FakeHidpp({**battery, L.F_NAME: (3, {2: [3]}),
+                      L.F_INFO: (2, {0: [3, *unit]})}, name="G502 LIGHTSPEED")
 
 
 def slots(keys):
@@ -204,6 +259,71 @@ class ReceiverTests(LogitechTestCase):
         self.assertEqual(p.poll(), [])
         self.assertTrue(any("HID++ 1.0" in line for line in p.diagnostics()))
 
+    def test_a_keyboard_without_features_reads_its_register(self):
+        """An MK710-desk generation keyboard (issue #159): no feature table at
+        all, battery in the old 0x07 status register."""
+        dev = FakeHidpp(registers={0x07: [7, 0x00, 0x00, 0x00]})
+        bus = self.use(receiver(0xC52B), {b"long": ({3: dev}, b"short")})
+        [st] = L.LogitechProvider().poll()
+        self.assertEqual((st.name, st.level, st.approx, st.charging, st.key),
+                         ("Logitech device", 90, "about 90% (full)", False, "logitech:c52b:3"))
+        self.assertIn((b"short", [0x10, 3, 0x81, 0x07, 0, 0, 0]), bus.writes)
+
+    def test_the_status_register_charging_byte(self):
+        dev = FakeHidpp(registers={0x07: [5, 0x21, 0x00, 0x00]})
+        self.use(receiver(0xC52B), {b"long": ({3: dev}, b"short")})
+        [st] = L.LogitechProvider().poll()
+        self.assertEqual((st.level, st.approx, st.charging), (50, "about 50% (good)", True))
+
+    def test_the_charge_register_beats_the_status_one(self):
+        dev = FakeHidpp(registers={0x0D: [87, 0, 0x50, 0], 0x07: [7, 0x00, 0x00, 0x00]})
+        self.use(receiver(0xC52B), {b"long": ({3: dev}, b"short")})
+        [st] = L.LogitechProvider().poll()
+        self.assertEqual((st.level, st.approx, st.charging), (87, "", True))
+
+    def test_registers_are_read_even_when_the_ping_errors(self):
+        dev = FakeHidpp(error=L.ERR_OLD_PROTOCOL, registers={0x07: [3, 0x00, 0x00, 0x00]})
+        self.use(receiver(0xC52B), {b"long": ({3: dev}, b"short")})
+        p = L.LogitechProvider()
+        [st] = p.poll()
+        self.assertEqual((st.level, st.approx), (20, "about 20% (low)"))
+        self.assertTrue(any("HID++ 1.0" in line for line in p.diagnostics()))
+
+    def test_a_foreign_register_error_does_not_eat_the_register_read(self):
+        # another app's error frame for a different register (the echo does not
+        # match) sits ahead of the real reply: it must be skipped, not taken as
+        # this register's answer (review by @ahmedkhursheed23)
+        dev = FakeHidpp(registers={0x0D: [87, 0, 0x50]},
+                        register_noise=[[0x10, 3, 0x8F, 0x81, 0x05, 0x01, 0]])
+        self.use(receiver(0xC52B), {b"long": ({3: dev}, b"short")})
+        [st] = L.LogitechProvider().poll()
+        self.assertEqual((st.level, st.charging), (87, True))
+
+    def test_a_20_error_ends_the_register_wait_at_once(self):
+        # a HID++ 2.0 device without a battery feature answers register reads
+        # with the 2.0 error (`.. FF ..` in byte 2): it used to wait the full
+        # timeout for each register, about 1.2 s per poll (review by
+        # @ahmedkhursheed23)
+        import time as _time
+        dev = FakeHidpp({L.F_NAME: (3, {2: [3]})}, name="G502 X",
+                        register_error_form=0xFF)
+        self.use(receiver(), {b"long": ({1: dev}, b"short")})
+        p = L.LogitechProvider()
+        t0 = _time.monotonic()
+        out = p.poll()
+        dt = _time.monotonic() - t0
+        self.assertEqual(out, [])                 # no reading from this device
+        self.assertTrue(any("no battery reading" in line for line in p.diagnostics()))
+        # the old code waited TIMEOUT (0.05 s here) per register, twice
+        self.assertLess(dt, 0.05)
+
+    def test_a_charging_only_register_reply_is_no_reading(self):
+        dev = FakeHidpp(registers={0x07: [0, 0x21, 0x00, 0x00]})
+        self.use(receiver(0xC52B), {b"long": ({3: dev}, b"short")})
+        p = L.LogitechProvider()
+        self.assertEqual(p.poll(), [])
+        self.assertTrue(any("no battery reading" in line for line in p.diagnostics()))
+
     def test_error_reply_for_another_app_is_ignored(self):
         """G HUB talks to the same receiver. Its error replies carry its own swid."""
         bus = self.use(receiver(), {b"long": ({1: g502()}, b"short")})
@@ -266,10 +386,81 @@ class TwoReceiverTests(LogitechTestCase):
     def test_two_identical_receivers_get_two_icons(self):
         a, sa, la = self.receiver_at(b"7&aaaa")
         b, sb, lb = self.receiver_at(b"7&bbbb")
-        self.use(a + b, {la: ({1: g502()}, sa), lb: ({1: g502()}, sb)})
+        self.use(a + b, {la: ({1: g502()}, sa), lb: ({1: g502(unit=(1, 2, 3, 4))}, sb)})
+        keys = sorted(st.key for st in L.LogitechProvider().poll())
+        self.assertEqual(keys, ["logitech:01020304", "logitech:C15E09CD"])
+
+    def test_two_identical_receivers_without_unit_ids_get_two_icons(self):
+        """Without a unit id the key is the slot, and both receivers have a slot 1."""
+        a, sa, la = self.receiver_at(b"7&aaaa")
+        b, sb, lb = self.receiver_at(b"7&bbbb")
+        self.use(a + b, {la: ({1: FakeHidpp(VOLTAGE_76)}, sa), lb: ({1: FakeHidpp(VOLTAGE_76)}, sb)})
         keys = sorted(st.key for st in L.LogitechProvider().poll())
         self.assertEqual(len(keys), 2)
         self.assertNotEqual(keys[0], keys[1])
+
+    def test_mouse_on_its_cable_keeps_one_icon(self):
+        """Two receivers of the same kind, then the mouse is plugged in to charge. The cable
+        reads the same unit id, so the greyed copy from the receiver must not stay."""
+        a, sa, la = self.receiver_at(b"7&aaaa")
+        b, sb, lb = self.receiver_at(b"7&bbbb")
+        self.use(a + b, {la: ({1: g502()}, sa), lb: ({}, sb)})
+        p = L.LogitechProvider()
+        [st] = p.poll()
+        self.assertEqual(st.key, "logitech:C15E09CD")
+        cable = [entry(0xC08D, 0xFF00, 1, b"cshort", "G502 LIGHTSPEED"),
+                 entry(0xC08D, 0xFF00, 2, b"clong", "G502 LIGHTSPEED")]
+        self.use(a + b + cable, {la: ({1: FakeHidpp(silent=True)}, sa), lb: ({}, sb),
+                                 b"clong": ({0xFF: g502(CHARGING_100)}, b"cshort")})
+        [st] = p.poll()
+        self.assertEqual((st.key, st.online, st.charging), ("logitech:C15E09CD", True, True))
+
+
+class VoltageChargingTests(LogitechTestCase):
+    """A voltage-only battery reads ~4.2 V on the charger: never a fake 100% (#271)."""
+
+    CABLE = [entry(0xC08D, 0xFF00, 1, b"cshort", "G502 LIGHTSPEED"),
+             entry(0xC08D, 0xFF00, 2, b"clong", "G502 LIGHTSPEED")]
+
+    def cable(self, params):
+        self.use(self.CABLE, {b"clong": ({0xFF: g502({L.F_VOLTAGE: (6, {0: params})})}, b"cshort")})
+
+    def test_keeps_level_from_before_charging(self):
+        p = L.LogitechProvider()
+        self.cable([0x10, 0x12, 0x00])                       # 4114 mV, discharging -> 94 %
+        [st] = p.poll()
+        self.assertEqual((st.level, st.charging, st.approx), (94, False, ""))
+        self.cable([0x10, 0x6A, 0x80])                       # 4202 mV on the cable
+        [st] = p.poll()
+        self.assertEqual((st.level, st.charging, st.ui_message), (94, True, "state.charging_was"))
+        self.assertIn("94%", st.approx)
+
+    def test_unknown_level_when_first_seen_charging(self):
+        self.cable([0x10, 0x6A, 0x80])
+        [st] = L.LogitechProvider().poll()
+        self.assertEqual((st.level, st.charging, st.ui_message),
+                         (None, True, "state.charging_level_unknown"))
+
+    def test_charge_complete_reports_full(self):
+        self.cable([0x10, 0x6A, 0x81])
+        [st] = L.LogitechProvider().poll()
+        self.assertEqual((st.level, st.charging, st.approx), (100, True, ""))
+
+    def test_adc_headset_charging(self):
+        self.use([entry(0x0A87, 0xFF43, 0x0202, b"hs")],
+                 {b"hs": ({0xFF: FakeHidpp(adc([0x0F, 0x7B, 0x01]))}, None)})
+        p = L.LogitechProvider()
+        [st] = p.poll()
+        self.assertEqual((st.level, st.charging), (76, False))
+        self.use([entry(0x0A87, 0xFF43, 0x0202, b"hs")],
+                 {b"hs": ({0xFF: FakeHidpp(adc([0x10, 0x68, 0x03]))}, None)})
+        [st] = p.poll()
+        self.assertEqual((st.level, st.charging), (76, True))
+
+    def test_charge_complete_helper(self):
+        self.assertTrue(L.charge_complete(L.F_VOLTAGE, [0x10, 0x6A, 0x81]))
+        self.assertFalse(L.charge_complete(L.F_VOLTAGE, [0x10, 0x6A, 0x80]))
+        self.assertFalse(L.charge_complete(L.F_ADC, [0x10, 0x6A, 0x81]))
 
 
 # ------------------------------------------------------------------ headsets
@@ -278,9 +469,9 @@ class HeadsetTests(LogitechTestCase):
         self.use([entry(pid, page, usage, b"hs")], {b"hs": ({0xFF: FakeHidpp(adc(params))}, None)})
         return L.LogitechProvider()
 
-    def test_g935_charging(self):
+    def test_g935_charging_level_not_shown(self):
         [st] = self.headset(0x0A87, [0x0F, 0x7B, 0x03]).poll()
-        self.assertEqual((st.name, st.level, st.charging, st.kind), ("Logitech G935", 76, True, "headset"))
+        self.assertEqual((st.name, st.level, st.charging, st.kind), ("Logitech G935", None, True, "headset"))
 
     def test_headset_off(self):
         self.assertEqual(self.headset(0x0ABA, [0x0F, 0x7B, 0x00]).poll(), [])
@@ -291,6 +482,32 @@ class HeadsetTests(LogitechTestCase):
         p = L.LogitechProvider()
         self.assertEqual(p.poll(), [])
         self.assertTrue(any("inactive" in line for line in p.diagnostics()))
+
+    def g535(self, reply=None, silent=False):
+        dev = FakeHidpp(headset_only=True, silent=silent,
+                        headset_registers={0x0D: reply} if reply else None)
+        bus = self.use([entry(0x0AC4, 0x000C, 0x0001, b"hs")], {b"hs": ({0xFF: dev}, None)})
+        return bus, L.LogitechProvider()
+
+    def test_g535_long_only_reads_its_charge_register(self):
+        """The G535 on its dongle has one long collection, no ff00 pair and no feature
+        table: it answers the old charge register, 11 ff 05 0d (HeadsetControl)."""
+        bus, p = self.g535([0x0F, 0x4C, 0x03])       # 3916 mV, charging
+        [st] = p.poll()
+        self.assertEqual((st.name, st.level, st.charging, st.kind),
+                         ("Logitech G535", 64, True, "headset"))
+        self.assertEqual(bus.writes[0][1][:4], [0x11, 0xFF, 0x05, 0x0D])
+        self.assertEqual(len(bus.writes), 1)
+
+    def test_g535_discharging_level(self):
+        bus, p = self.g535([0x0E, 0xE9, 0x01])       # 3817 mV, on battery
+        [st] = p.poll()
+        self.assertEqual((st.level, st.charging), (50, False))
+
+    def test_g535_off_shows_nothing(self):
+        bus, p = self.g535(silent=True)
+        self.assertEqual(p.poll(), [])
+        self.assertTrue(any("asleep" in line for line in p.diagnostics()))
 
     def test_g535_uses_consumer_collection(self):
         [st] = self.headset(0x0AC4, [0x0E, 0xA0, 0x01], page=0x000C, usage=0x0001).poll()
@@ -350,6 +567,26 @@ class ParseTests(unittest.TestCase):
         for feature, params, expected in self.CASES:
             with self.subTest(feature=hex(feature), params=params):
                 self.assertEqual(L.parse_battery(feature, params), expected)
+
+    REG_CASES = [
+        # register, params, (level, charging, approximate text)
+        (L.REG_BATTERY_STATUS, [7, 0x00, 0, 0], (90, False, "about 90% (full)")),
+        (L.REG_BATTERY_STATUS, [5, 0x21, 0, 0], (50, True, "about 50% (good)")),
+        (L.REG_BATTERY_STATUS, [3, 0x22, 0, 0], (20, True, "about 20% (low)")),
+        (L.REG_BATTERY_STATUS, [1, 0x00, 0, 0], (5, False, "about 5% (critical)")),
+        (L.REG_BATTERY_STATUS, [0, 0x21, 0, 0], (None, True, "")),   # no level in the reply
+        (L.REG_BATTERY_STATUS, [4, 0x00, 0, 0], (None, False, "")),  # not a known level
+        (L.REG_BATTERY_CHARGE, [87, 0, 0x50, 0], (87, True, "")),    # recharging
+        (L.REG_BATTERY_CHARGE, [87, 0, 0x30, 0], (87, False, "")),   # discharging
+        (L.REG_BATTERY_CHARGE, [100, 0, 0x90, 0], (100, True, "")),  # full, on the charger
+        (L.REG_BATTERY_CHARGE, [0, 0, 0x30, 0], (None, False, "")),  # not a percentage
+        (L.REG_BATTERY_CHARGE, [200, 0, 0x50, 0], (None, False, "")),
+    ]
+
+    def test_parse_register_battery(self):
+        for reg, params, expected in self.REG_CASES:
+            with self.subTest(reg=hex(reg), params=params):
+                self.assertEqual(L.parse_register_battery(reg, params), expected)
 
     def test_voltage_curve_ends(self):
         self.assertEqual(L.voltage_to_percent(4300), 100)

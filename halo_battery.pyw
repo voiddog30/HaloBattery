@@ -6,11 +6,15 @@ Supported:
   * WLmouse (Beast X / Beast X Max / Mini Pro)
   * Logitech (HID++ 2.0 mice, keyboards and headsets: Lightspeed / Unifying / Bolt receivers, G HUB not needed)
   * SteelSeries (Arctis Nova, Arctis 1 / 7 / 9 / Pro Wireless / 7+ headsets, GameBuds, Aerox mice,
-    Nova Pro Omni with its spare battery, GG not needed)
-  * Finalmouse UltralightX (on its 2.4 GHz dongle)
+    GG not needed)
   * MCHOSE (M7 Ultra and the rest of the 0x5253 family, on the 2.4 GHz receiver)
-  * HyperX (Cloud II and Cloud III Wireless), JBL Quantum 910, Corsair, Astro A50 Gen 5,
-    Keychron, Lofree, Pulsar / ATK / VXE, ASUS ROG / TUF, G-Wolves, LAMZU Maya X and AM Infinity 8K mice
+  * HyperX (Cloud II, Cloud III Wireless and Cloud Flight Wireless), JBL Quantum 910,
+    Corsair, Astro A50 Gen 5,
+    Keychron, Lofree, Pulsar / ATK / VXE, ASUS ROG / TUF (and ASUS ROG keyboards on the OMNI receiver), G-Wolves,
+    LAMZU Maya X, VAXEE, DAREU A950, MCHOSE V9 Pro and AM Infinity 8K mice
+  * Finalmouse UltralightX (on its 2.4 GHz dongle)
+  * Jabra headsets behind a Link 380 / 390 dongle (Evolve2 and others, Jabra Direct not needed)
+  * NVIDIA SHIELD Controller (2017)
   * Xbox-compatible controllers (Windows.Gaming.Input / XInput)
   * PlayStation controllers (DualShock 4, DualSense): directly over USB/HID
   * 8BitDo controllers in D-input mode (Pro 2, Pro 3, SN30 / SF30 Pro), while Steam
@@ -31,33 +35,51 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import zlib
+from dataclasses import replace
 from logging.handlers import RotatingFileHandler
 from typing import Callable, Dict, List, Optional, Set
 
 APP_NAME = "HaloBattery"
 APP_TITLE = "Halo Battery"
-VERSION = "1.14.0"
+VERSION = "1.17.0"
+PRETEND_VERSION = ""             # --pretend-version 1.0.0: test the updater with a built copy
 LEGACY_NAME = "BatteryTray"      # the app's previous name (settings and autostart are migrated)
 
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE_DIR)
+    # Frozen builds use PyInstaller's module path. Loose sources beside the EXE
+    # must not override its bundled packages (for example an older halo/ folder).
+    sys.path.insert(0, BASE_DIR)
 
 APPDATA_DIR = os.environ.get("APPDATA", os.path.expanduser("~"))
 PORTABLE_MARKER = "portable.txt"   # next to the app: keep settings and the log in its folder
 
 
 def _writable(folder: str) -> bool:
-    """True if a file can be created in the folder (os.access is not reliable on Windows)."""
+    """True if a file can be created in the folder (os.access is not reliable on Windows).
+
+    One exclusive open, not tempfile: on Windows tempfile retries PermissionError while
+    os.access says the folder is writable, even when its ACL denies creating files
+    (Program Files), and start-up hung in that loop (same fix as updates.can_install)."""
+    probe = os.path.join(folder, f".halobattery-write-{uuid.uuid4().hex}.tmp")
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_TEMPORARY", 0)
     try:
-        with tempfile.TemporaryFile(dir=folder):
-            pass
-        return True
+        fd = os.open(probe, flags, 0o600)
+        os.close(fd)
+        if os.name != "nt":
+            os.unlink(probe)
     except OSError:
         return False
+    return True
+
+
+def startup_retry_due(nothing_shown: bool, seconds_since_start: float) -> bool:
+    """True while the app has found no device yet and is still in its start-up window (#214)."""
+    return nothing_shown and seconds_since_start < STARTUP_RETRY_WINDOW
 
 
 def _calculate_data_dir(base_dir: str, appdata_dir: Optional[str] = None):
@@ -74,8 +96,20 @@ def _calculate_data_dir(base_dir: str, appdata_dir: Optional[str] = None):
     return False, os.path.join(appdata_dir, APP_NAME)
 
 
-PORTABLE_REQUESTED = os.path.exists(os.path.join(BASE_DIR, PORTABLE_MARKER))
-PORTABLE, DATA_DIR = _calculate_data_dir(BASE_DIR)
+def _data_base_dir(argv: List[str]) -> str:
+    """The folder whose portable.txt decides where the data goes. The copy that
+    finishes an update (--finish-update) runs from %TEMP%, so it uses the folder of the
+    app it updates; everything else uses its own folder."""
+    if "--finish-update" in argv and "--app-dir" in argv:
+        i = argv.index("--app-dir")
+        if i + 1 < len(argv) and os.path.isdir(argv[i + 1]):
+            return argv[i + 1]
+    return BASE_DIR
+
+
+DATA_BASE_DIR = _data_base_dir(sys.argv)
+PORTABLE_REQUESTED = os.path.exists(os.path.join(DATA_BASE_DIR, PORTABLE_MARKER))
+PORTABLE, DATA_DIR = _calculate_data_dir(DATA_BASE_DIR)
 os.makedirs(DATA_DIR, exist_ok=True)
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 LOG_PATH = os.path.join(DATA_DIR, "halo_battery.log")
@@ -103,22 +137,23 @@ except ImportError:
 import pystray  # noqa: E402
 from pystray import Menu, MenuItem as Item  # noqa: E402
 
-import flyout  # noqa: E402
-import history  # noqa: E402
-import icons  # noqa: E402
-import updates  # noqa: E402
-import winevents  # noqa: E402
+from halo import flyout, history, icons, updates, whatsnew, winevents  # noqa: E402
+from halo import i18n, tray_dpi  # noqa: E402
 from providers import hidlist  # noqa: E402
 from providers import (AmInfinityProvider, AstroProvider, AsusProvider,  # noqa: E402
-                       AudezeProvider, BarracudaProvider, BluetoothProvider, CorsairProvider, DeviceStatus,
-                       EightBitDoProvider, FinalmouseProvider,
+                       AudezeProvider, BarracudaProvider, BarracudaXProvider, BluetoothProvider, CorsairProvider,
+                       DeviceStatus, DjiProvider,
+                       EightBitDoProvider,
                        GWolvesProvider, HyperXAlpha2Provider, HyperXCloud3Provider, HyperXCloud3SProvider,
                        HyperXProvider, JblProvider,
                        KeychronProvider, LamzuProvider, LofreeProvider, LogitechProvider,
                        LogitechCenturionProvider,
-                       MchoseProvider, NintendoProvider, PlayStationProvider, PulsarProvider,
+                       MchoseProvider, NintendoProvider, NzxtProvider, PlayStationProvider, PulsarProvider,
                        RazerProvider, SteelSeriesEliteProvider, SteelSeriesProvider,
-                       WLmouseProvider, XInputProvider)
+                       VaxeeProvider, WLmouseProvider, XInputProvider, SteamProvider, EndgameWEProvider,
+                       AjazzProvider, AtkKeyboardProvider, AtkNearlinkProvider, AulaProvider, DareuProvider,
+                       EweadnProvider, FinalmouseProvider, HyperXAlphaWirelessProvider, HyperXCloudFlightProvider,
+                       InphicProvider, JabraProvider, LamzuAtlantisProvider, MchoseKbProvider, MchoseV9Provider, MonsGeekProvider, RapooProvider, ShieldProvider, SkullcandyProvider, SonyInzoneProvider, TurtleBeachProvider, Endgame4kProvider, PlantronicsProvider, HyperXNgenuityProvider, IRocksProvider, AlienwareProvider, GloriousProvider, LamzuSinowealthProvider, UrxProvider)
 from providers.bluetooth import BluetoothWatcher  # noqa: E402
 from providers.jbl import PROBE_LISTEN_S as JBL_PROBE_LISTEN_S  # noqa: E402
 
@@ -126,6 +161,7 @@ HEADSET_WORDS = ("blackshark", "kraken", "barracuda", "nari", "thresher", "heads
                  "headphone", "earbud", "buds", "hammerhead", "airpods")
 
 DEFAULTS = {
+    "language": "en",   # initial Windows UI detection happens only in App(), never in --probe
     "interval": 60,      # seconds between polls
     "low": 20,           # low battery notification threshold, %
     "full_alert": True,  # notification when a charging device reaches 100 %
@@ -149,38 +185,71 @@ DEFAULTS = {
     "time_left": True,      # "about N h of use left" in the tooltip (history.py)
     "percent_in_icon": False,  # the level as a number in the ring, instead of the pictogram
     "quiet_fullscreen": True,  # while a game is full screen: hold alerts, poll every 5 min
+    "keep_disconnected": False,  # keep a gone device's icon, greyed with its last level, until restart (#151)
     "status_file": False,      # write status.json for Rainmeter, Stream Deck, scripts
 }
 
 # Preferences > Device types: provider name -> what the user sees. Windows Bluetooth
 # devices keep their own switch ("bluetooth" above), as before.
 PROVIDER_LABELS = {
+    "endgame_we": "Endgame Gear XM2we",
     "8bitdo": "8BitDo controllers",
+    "ajazz": "AJAZZ mice",
+    "alienware": "Alienware Pro Wireless keyboard",
     "am_infinity": "AM Infinity 8K (Angry Miao)",
     "astro": "Astro A50",
-    "asus": "ASUS ROG / TUF mice",
+    "asus": "ASUS ROG / TUF mice, keyboards and headsets",
+    "atk_keyboard": "ATK V75X keyboard",
+    "atk_nearlink": "ATK X1 Nearlink mice",
     "audeze": "Audeze Maxwell",
+    "aula": "AULA F87 Pro V2C keyboards",
     "barracuda": "Razer Barracuda Pro",
+    "barracuda_x": "Razer Barracuda X",
     "corsair": "Corsair headsets",
+    "dji": "DJI Mic Mini 2",
+    "dareu": "DAREU mice",
+    "eweadn": "EWEADN / 前行者 mice",
     "finalmouse": "Finalmouse UltralightX",
+    "glorious": "Glorious Model O Wireless",
     "gwolves": "G-Wolves mice",
     "hyperx": "HyperX Cloud II Wireless",
     "hyperx_alpha2": "HyperX Cloud Alpha 2",
-    "hyperx_cloud3": "HyperX Cloud III Wireless",
+    "hyperx_alpha_wireless": "HyperX Cloud Alpha Wireless",
+    "hyperx_cloud3": "HyperX Cloud III Wireless, Cloud II Core Wireless",
     "hyperx_cloud3s": "HyperX Cloud III S Wireless",
+    "hyperx_cloud_flight": "HyperX Cloud Flight Wireless",
+    "hyperx_ngenuity": "HyperX Pulsefire mice",
+    "inphic": "Inphic / Attack Shark mice",
+    "irocks": "iRocks M31R",
+    "jabra": "Jabra headsets (Link 380 / 390 dongle)",
     "jbl": "JBL Quantum",
     "keychron": "Keychron",
     "lamzu": "LAMZU mice",
-    "lofree": "Lofree keyboards",
+    "lamzu_sw": "Lamzu Tachi (8K receiver)",
+    "urx": "URX Core75",
+    "lofree": "Lofree keyboards, AULA V9 mice",
     "logitech": "Logitech",
     "logitech_centurion": "Logitech G PRO X 2 LIGHTSPEED",
     "mchose": "MCHOSE mice",
+    "mchose_kb": "MCHOSE keyboards",
+    "mchose_v9": "MCHOSE V9 Pro",
+    "monsgeek": "MonsGeek keyboards",
     "nintendo": "Nintendo Switch controllers",
+    "nzxt": "NZXT mice",
+    "endgame_4k": "Endgame Gear 4K mice (XM2w / OP1w)",
+    "plantronics": "Plantronics headsets (BT600 adapter)",
     "playstation": "PlayStation controllers",
-    "pulsar": "Pulsar / ATK VXE mice",
+    "pulsar": "Pulsar / ATK VXE / Redragon mice",
+    "rapoo": "Rapoo mice and keyboards",
     "razer": "Razer mice and headsets",
+    "shield": "NVIDIA SHIELD controllers",
+    "skullcandy": "Skullcandy headsets",
+    "sony_inzone": "Sony INZONE H9",
+    "steam": "Steam Controller (2025)",
     "steelseries": "SteelSeries",
     "steelseries_elite": "SteelSeries Arctis Nova Elite",
+    "turtlebeach": "Turtle Beach headsets",
+    "vaxee": "VAXEE mice",
     "wlmouse": "WLmouse",
     "xinput": "Xbox-compatible controllers",
 }
@@ -192,11 +261,17 @@ def make_providers(jbl_listen_first: float = 0.0) -> list:
             HyperXAlpha2Provider(), HyperXCloud3Provider(), HyperXProvider(),
             KeychronProvider(), PulsarProvider(),
             JblProvider(listen_first=jbl_listen_first), LogitechProvider(), SteelSeriesProvider(), XInputProvider(),
-            PlayStationProvider(), EightBitDoProvider(), BarracudaProvider(), NintendoProvider(),
-            AsusProvider(), GWolvesProvider(), LofreeProvider(), AstroProvider(), CorsairProvider(),
-            LamzuProvider(), AmInfinityProvider(),
-            SteelSeriesEliteProvider(), LogitechCenturionProvider(), HyperXCloud3SProvider(),
-            FinalmouseProvider()]
+            PlayStationProvider(), EightBitDoProvider(), BarracudaProvider(), BarracudaXProvider(), NintendoProvider(),
+            AsusProvider(), GWolvesProvider(), AulaProvider(), LofreeProvider(), AstroProvider(), CorsairProvider(),
+            LamzuProvider(), VaxeeProvider(), AmInfinityProvider(),
+            SteelSeriesEliteProvider(), LogitechCenturionProvider(), HyperXCloud3SProvider(), NzxtProvider(),
+            SteamProvider(), EndgameWEProvider(),
+            MchoseV9Provider(), DareuProvider(), ShieldProvider(), LamzuAtlantisProvider(),
+            InphicProvider(), TurtleBeachProvider(), SkullcandyProvider(), RapooProvider(), AjazzProvider(),
+            IRocksProvider(),
+            SonyInzoneProvider(), AtkNearlinkProvider(), FinalmouseProvider(), AtkKeyboardProvider(),
+            HyperXAlphaWirelessProvider(), JabraProvider(), HyperXCloudFlightProvider(), MonsGeekProvider(),
+            EweadnProvider(), MchoseKbProvider(), Endgame4kProvider(), PlantronicsProvider(), HyperXNgenuityProvider(), AlienwareProvider(), DjiProvider(), GloriousProvider(), LamzuSinowealthProvider(), UrxProvider()]
 
 
 # ---------------------------------------------------------------- config
@@ -220,6 +295,8 @@ _config_lock = threading.Lock()
 def _valid_setting(key: str, value) -> bool:
     """A value from the settings file has the type of its default (and a sane range)."""
     default = DEFAULTS[key]
+    if key == "language":
+        return isinstance(value, str) and value in i18n.LANGUAGES
     if isinstance(default, bool):
         return isinstance(value, bool)
     if isinstance(default, int):
@@ -230,17 +307,21 @@ def _valid_setting(key: str, value) -> bool:
     return isinstance(value, type(default))
 
 
-def load_config() -> dict:
+def load_config(*, initialize_language: bool = False) -> dict:
     """The defaults, overridden by the settings file. A damaged file (not JSON, or
     not a JSON object) is kept as config.json.bad and the defaults are used; a
     single wrong value (a string for the poll interval, an interval of 0) falls
-    back to its default instead of breaking the app."""
+    back to its default instead of breaking the app. Only application startup
+    opts into detecting and persisting a missing language; ordinary reads and
+    technical tools have no language initialization side effects."""
     cfg = dict(DEFAULTS)
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8-sig") as f:      # editors may add a BOM
             data = json.load(f)
+    except FileNotFoundError:
+        data = {}                                # no settings yet
     except OSError:
-        return cfg                               # no settings yet
+        return cfg
     except ValueError as e:
         data = e
     if not isinstance(data, dict):
@@ -249,13 +330,16 @@ def load_config() -> dict:
         try:
             os.replace(CONFIG_PATH, CONFIG_PATH + ".bad")
         except OSError:
-            pass
-        return cfg
+            return cfg                           # never overwrite an unpreserved damaged file
+        data = {}                                # startup initializes language after recovery
     for key, value in data.items():
         if key in DEFAULTS and not _valid_setting(key, value):
             log.warning("config: ignoring %s=%r, using %r", key, value, DEFAULTS[key])
             continue
         cfg[key] = value
+    if initialize_language and "language" not in data:
+        cfg["language"] = i18n.detect_language()
+        save_config(cfg)                          # remember it before the first tray icon
     return cfg
 
 
@@ -327,18 +411,26 @@ def running_from_temp() -> bool:
 
 
 # The texts of the app's notifications.
-def low_battery_text(name: str, level: Optional[int], approx: bool) -> str:
-    left = "battery is low" if approx else f"{level}% left"
-    return f"{name}: {left}. Time to charge."
+def low_battery_text(name: str, level: Optional[int], approx: bool, *, language: str = "en") -> str:
+    key = "notification.low_approx" if approx else "notification.low"
+    return i18n.translate(key, language=language, name=name, level=level)
 
 
-def fully_charged_text(name: str) -> str:
-    return f"{name} is fully charged."
+def fully_charged_text(name: str, *, language: str = "en") -> str:
+    return i18n.translate("notification.full", language=language, name=name)
 
 
-def update_text(latest: str) -> str:
-    return (f"Version {latest} is available. Right-click a battery icon "
-            f"and choose \"Download v{latest}…\".")
+def update_text(latest: str, install: bool = True, *, language: str = "en") -> str:
+    key = "notification.update_install" if install else "notification.update"
+    return i18n.translate(key, language=language, version=latest)
+
+
+def update_item_text(latest: str, install: bool, progress: Optional[int] = None,
+                     *, language: str = "en") -> str:
+    if progress is not None:
+        return i18n.translate("menu.downloading", language=language, version=latest, progress=progress)
+    key = "menu.install_update" if install else "menu.download"
+    return i18n.translate(key, language=language, version=latest)
 
 
 # Windows titles a notification with the app that sent it. Without an id of its own the
@@ -390,9 +482,7 @@ def set_app_id() -> None:
         log.warning("app id: %s", e)
 
 
-TEMP_AUTOSTART_TEXT = ("Halo Battery is running from a temporary folder (straight from the ZIP). "
-                       "Extract the ZIP to a folder of its own, run HaloBattery.exe from there, "
-                       "then turn on Start with Windows.")
+TEMP_AUTOSTART_TEXT = i18n.translate("notification.temp_autostart")
 
 
 def autostart_enabled() -> bool:
@@ -470,6 +560,35 @@ def refresh_autostart() -> bool:
         return False
 
 
+# Written by the installer (installer/HaloBattery.iss, AppId + "_is1").
+UNINSTALL_KEY = (r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+                 r"\{1E3A3904-9F39-4150-82EA-25D23968E2D6}_is1")
+
+
+def sync_installed_version(app_dir: str = BASE_DIR, version: str = VERSION) -> bool:
+    """After an in-app update, show the new version in Settings > Apps. Only when this
+    copy is the one the installer put there; a portable copy leaves the entry alone."""
+    if sys.platform != "win32" or not getattr(sys, "frozen", False) or PRETEND_VERSION:
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY, 0,
+                            winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE) as k:
+            where, _ = winreg.QueryValueEx(k, "InstallLocation")
+            if os.path.normcase(os.path.abspath(str(where))) != os.path.normcase(os.path.abspath(app_dir)):
+                return False
+            try:
+                shown, _ = winreg.QueryValueEx(k, "DisplayVersion")
+            except OSError:
+                shown = ""
+            if shown == version:
+                return False
+            winreg.SetValueEx(k, "DisplayVersion", 0, winreg.REG_SZ, version)
+            return True
+    except OSError:
+        return False                         # not installed by setup
+
+
 def single_instance() -> bool:
     if sys.platform != "win32":
         return True
@@ -483,6 +602,16 @@ def single_instance() -> bool:
 # game, 4 = presentation mode. 5 = normal; 1, 6 and 7 are not about the screen.
 QUNS_FULLSCREEN = (2, 3, 4)
 QUIET_INTERVAL = 300       # s between polls while a game is full screen
+# Right after start-up (logon, or a boot with Windows Fast Startup) receivers can still be
+# waking up when the first poll runs. While nothing has been found yet, poll again every
+# STARTUP_RETRY_INTERVAL s during the first STARTUP_RETRY_WINDOW s instead of waiting the
+# whole poll interval (#214).
+STARTUP_RETRY_INTERVAL = 10
+STARTUP_RETRY_WINDOW = 90
+INPUT_WAKE_GAP = 5          # s between input-driven re-reads of a greyed (asleep)
+                            # device: the first input re-reads it at once, and while
+                            # input keeps coming (touchpad, typing) a poll every few
+                            # seconds still sees the device wake (see wait_next, #87)
 
 
 def fullscreen_app_running() -> bool:
@@ -500,7 +629,8 @@ def fullscreen_app_running() -> bool:
 
 # ------------------------------------------------------------- tray icons
 WM_RBUTTONUP = 0x0205
-ICON_HANDLE_CACHE = 64     # icon handles kept per tray icon (a charging cycle is 30 frames)
+WM_QUERYENDSESSION = 0x0011
+ICON_HANDLE_CACHE = 128    # bounded handles per tray icon; fits a full 90-frame charging cycle
 IDLE_KEY = "HaloBattery:idle"   # the "no devices found" icon's id
 _tray_classes: Dict[type, type] = {}
 
@@ -519,10 +649,9 @@ def _destroy_handles(cache: dict) -> None:
     handles = [h for _img, h in cache.values()]
     cache.clear()
     if sys.platform == "win32":
-        import ctypes
         for h in handles:
             try:
-                ctypes.windll.user32.DestroyIcon(h)
+                tray_dpi.destroy_icon_handle(h)
             except Exception:
                 pass
 
@@ -535,8 +664,42 @@ def _make_tray_class(base: type) -> type:
         * the id Windows knows the icon by is icon_uid(key), not id(self);
         * the icon handle of every image is kept. pystray writes each new image to a
           temporary .ico file and loads it back, so the charging animation wrote
-          about ten files a second per charging device, which a disk and an
-          antivirus notice (#61). The 30 frames of a cycle are now loaded once."""
+          a file for every charging frame, which a disk and an antivirus notice
+          (#61). A full 90-frame cycle is loaded once and then reused."""
+
+        def __init__(self, *args, **kwargs):
+            # Explorer's window thread can restore an icon during an app-thread
+            # DPI swap. Keep handle loading, notification and disposal atomic.
+            self._hb_handle_lock = threading.RLock()
+            self._hb_handles_closed = False
+            super().__init__(*args, **kwargs)
+
+        def _update_icon(self):
+            with self._hb_handle_lock:
+                if self._hb_handles_closed:
+                    return None
+                self._icon_valid = False
+                if sys.platform == "win32" and not getattr(self, "_visible", True):
+                    # pystray normally MODIFYs before its first ADD. There is no
+                    # shell entry yet; prepare the handle and let _show add it.
+                    self._release_icon()
+                    self._assert_icon_handle()
+                    return None
+                return super()._update_icon()
+
+        def _show(self):
+            with self._hb_handle_lock:
+                if self._hb_handles_closed:
+                    return None
+                self._icon_valid = False
+                result = super()._show()
+                self._icon_valid = True
+                return result
+
+        def _hide(self):
+            with self._hb_handle_lock:
+                # DELETE must follow any in-flight Explorer ADD, including stop.
+                return super()._hide()
 
         def _message(self, code, flags, **kwargs):
             uid = getattr(self, "_hb_uid", None)
@@ -544,34 +707,44 @@ def _make_tray_class(base: type) -> type:
                 return super()._message(code, flags, **kwargs)
             import ctypes
             from pystray._util import win32
-            win32.Shell_NotifyIcon(code, win32.NOTIFYICONDATAW(
+            succeeded = win32.Shell_NotifyIcon(code, win32.NOTIFYICONDATAW(
                 cbSize=ctypes.sizeof(win32.NOTIFYICONDATAW),
                 hWnd=self._hwnd,
-                hID=uid,
+                uID=uid,
                 uFlags=flags,
                 **kwargs))
+            if not succeeded and (code == win32.NIM_ADD or
+                                  (code == win32.NIM_MODIFY and flags & win32.NIF_ICON)):
+                # Keep pystray's best-effort tooltip/balloon updates. Only failed
+                # image swaps need retrying; GetLastError is not reliable here.
+                raise OSError(f"Shell_NotifyIcon failed (operation={code}, uid={uid})")
 
         def _assert_icon_handle(self):
-            cache = getattr(self, "_hb_handles", None)
-            if cache is None or self._icon_handle:
-                return super()._assert_icon_handle()
-            img = self.icon
-            hit = cache.get(id(img))
-            if hit is not None and hit[0] is img:     # the cache holds img, so its id is not reused
-                self._icon_handle = hit[1]
+            with self._hb_handle_lock:
+                cache = getattr(self, "_hb_handles", None)
+                if cache is None or self._icon_handle:
+                    return super()._assert_icon_handle()
+                img = self.icon
+                hit = cache.get(id(img))
+                if hit is not None and hit[0] is img:     # the cache holds img, so its id is not reused
+                    self._icon_handle = hit[1]
+                    return None
+                if sys.platform == "win32":
+                    self._icon_handle = tray_dpi.load_icon_handle(img)
+                else:
+                    super()._assert_icon_handle()
+                if self._icon_handle:
+                    if len(cache) >= ICON_HANDLE_CACHE:
+                        _destroy_handles(cache)           # the handle just loaded is not among them
+                    cache[id(img)] = (img, self._icon_handle)
                 return None
-            super()._assert_icon_handle()
-            if self._icon_handle:
-                if len(cache) >= ICON_HANDLE_CACHE:
-                    _destroy_handles(cache)           # the handle just loaded is not among them
-                cache[id(img)] = (img, self._icon_handle)
-            return None
 
         def _release_icon(self):
-            if getattr(self, "_hb_handles", None) is None:
-                return super()._release_icon()
-            self._icon_handle = None                  # the handle stays in the cache
-            return None
+            with self._hb_handle_lock:
+                if getattr(self, "_hb_handles", None) is None:
+                    return super()._release_icon()
+                self._icon_handle = None                  # the handle stays in the cache
+                return None
 
         def _on_notify(self, wparam, lparam):
             # a right-click opens the Windows 11 style menu (flyout.py); the classic
@@ -585,12 +758,24 @@ def _make_tray_class(base: type) -> type:
                     log.warning("menu: %s", e)
             return super()._on_notify(wparam, lparam)
 
+        def discard_cached_handles(self) -> None:
+            """After a successful DPI swap, retain only the currently loaded HICON."""
+            with self._hb_handle_lock:
+                cache = getattr(self, "_hb_handles", None)
+                if cache:
+                    stale = {k: v for k, v in cache.items() if v[1] != self._icon_handle}
+                    for k in stale:
+                        del cache[k]
+                    _destroy_handles(stale)
+
         def forget_handles(self) -> None:
-            """Free the cached handles once the icon is gone."""
-            cache = getattr(self, "_hb_handles", None)
-            if cache:
-                _destroy_handles(cache)
-            self._icon_handle = None
+            """Free cached handles and reject late Explorer restores during stop."""
+            with self._hb_handle_lock:
+                self._hb_handles_closed = True
+                cache = getattr(self, "_hb_handles", None)
+                if cache:
+                    _destroy_handles(cache)
+                self._icon_handle = None
 
     return TrayIcon
 
@@ -617,14 +802,29 @@ def tray_icon(key: str, *args, **kwargs):
     ic = cls(*args, **kwargs)
     ic._hb_uid = icon_uid(key)
     ic._hb_handles = {}
+    handlers = getattr(ic, "_message_handlers", None)
+    if handlers is not None:
+        # pystray's window procedure answers every message it has no handler for with 0, and
+        # 0 to WM_QUERYENDSESSION means "do not end the session": the icon vetoed every
+        # shutdown, log-off and restart until Windows gave up on it (#242)
+        handlers.setdefault(WM_QUERYENDSESSION, lambda wparam, lparam: 1)
     return ic
 
 
 # ------------------------------------------------------------ formatting
+# a device that reports its own kind wins; otherwise the name decides. " mic" catches
+# "DJI Mic Mini 2 TX1" without dragging in names that merely contain the letters.
+MIC_WORDS = ("microphone", " mic", "mic ")
+
+
 def badge_for(st: DeviceStatus) -> str:
-    if st.kind in ("headset", "mouse", "gamepad", "keyboard"):   # reported by the device itself
+    if st.kind in ("headset", "mouse", "gamepad", "keyboard", "microphone",
+                   "speaker", "webcam", "health", "smart_home",
+                   "watch", "display", "tracker"):   # from the device
         return st.kind
     n = st.name.lower()
+    if any(w in n for w in MIC_WORDS):
+        return "microphone"
     if any(w in n for w in HEADSET_WORDS):
         return "headset"
     if st.source == "playstation":
@@ -638,7 +838,13 @@ def badge_for(st: DeviceStatus) -> str:
 
 # the pictograms a user can pick for one device ("Icon" in its menu); "" = automatic
 PICTOGRAM_CHOICES = (("", "Automatic"), ("mouse", "Mouse"), ("keyboard", "Keyboard"),
+                     ("microphone", "Microphone"), ("speaker", "Speaker"), ("webcam", "Webcam"),
+                     ("health", "Health device"), ("smart_home", "Smart home"),
+                     ("watch", "Smartwatch"), ("display", "Display / TV"), ("tracker", "Tag / Tracker"),
                      ("headset", "Headset"), ("gamepad", "Controller"), ("bluetooth", "Bluetooth"))
+
+CONTROLLER_BRANDS = ("default", "xbox", "playstation", "nintendo")
+CONTROLLER_PICTOGRAMS = ("gamepad", "dualshock", "dualsense")
 
 GAMEPAD_WORDS = ("controller", "gamepad", "joystick", "joy-con")
 
@@ -737,29 +943,79 @@ def drop_bluetooth_duplicates(results: List[DeviceStatus],
     return kept
 
 
-def describe(st: DeviceStatus, name: Optional[str] = None, left: str = "") -> str:
+try:                             # Win32 only; harmless to define elsewhere
+    import ctypes as _ctypes
+
+    class LASTINPUTINFO(_ctypes.Structure):
+        """Defined once: this used to be re-declared on every wait-loop tick
+        (review by @ahmedkhursheed23, #202)."""
+        _fields_ = [("cbSize", _ctypes.c_uint), ("dwTime", _ctypes.c_uint)]
+except Exception:                # pragma: no cover
+    LASTINPUTINFO = None
+
+
+def last_input_ms() -> Optional[int]:
+    """The tick of the last keyboard or mouse input anywhere on Windows, or None.
+
+    Used to notice the user coming back to the PC: a sleeping mouse is awake by the
+    time its first movement lands here, so a device whose reading is greyed out
+    (asleep) can be re-read right then instead of at the next scheduled poll - see
+    wait_next(). A few seconds of accuracy are irrelevant; only "there was a pause,
+    then input" matters."""
+    if sys.platform != "win32" or LASTINPUTINFO is None:
+        return None
+    try:
+        import ctypes
+
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        return int(info.dwTime)
+    except Exception:            # a probe must never take the app down
+        return None
+
+
+def describe(st: DeviceStatus, name: Optional[str] = None, left: str = "", *, language: str = "en") -> str:
     """The tooltip text. `name` replaces the device's own name (set with "Rename..."),
     `left` is the estimated time left ("about 5 h of use left"), shown only while the
     device is awake and on battery."""
-    return f"{name or st.name}: {device_state(st, left)}"
+    return i18n.translate("device.description", language=language,
+                          name=name or st.name, state=device_state(st, left, language=language))
 
 
-def device_state(st: DeviceStatus, left: str = "") -> str:
+def device_state(st: DeviceStatus, left: str = "", *, language: str = "en") -> str:
     """The part of describe() after the name: "85%, charging", "no link ..."."""
+    if st.polling_paused:
+        # an idle keyboard whose polling is parked until it is used (#308): the last level
+        if st.level is None:
+            return i18n.translate("state.not_reported", language=language)
+        return i18n.translate("state.level", language=language, level=st.level)
     if st.approx:
         state = st.approx          # XInput: coarse levels or "not reported yet", never a fake "NN%"
+        if language != "en" and getattr(st, "ui_message", ""):
+            params = dict(getattr(st, "ui_params", {}))
+            if "grade" in params:
+                params["grade"] = i18n.translate("level." + params["grade"], language=language)
+            state = i18n.translate(st.ui_message, language=language, **params)
+            if params.get("bluetooth"):
+                state = i18n.translate("state.over_bluetooth", language=language, state=state)
+            if params.get("charging"):
+                state = i18n.translate("state.charging", language=language, state=state)
+            if params.get("last_known"):
+                state = i18n.translate("state.last_known", language=language, state=state)
     elif st.level is None:
-        state = "no link (off or asleep)"
+        state = i18n.translate("state.no_link", language=language)
     else:
-        state = f"{st.level}%"
+        state = i18n.translate("state.level", language=language, level=st.level)
         if st.charging:
-            state += ", charging"
+            state = i18n.translate("state.charging", language=language, state=state)
+        elif not st.charging_known:
+            state = i18n.translate("state.charging_unknown", language=language, state=state)
         if not st.online:
-            state += " (last known value, device asleep)"
-        elif left and not st.charging:
-            state += f", {left}"
-    if st.extra:
-        state += f", {st.extra}"
+            state = i18n.translate("state.asleep", language=language, state=state)
+        elif left and not st.charging and st.charging_known:
+            state = i18n.translate("state.time_left", language=language, state=state, left=left)
     return state
 
 
@@ -801,25 +1057,56 @@ def play_low_sound(kind: str) -> None:
 
 
 # ------------------------------------------------------------- hide / rename
-def ask_name(current: str) -> Optional[str]:
+def ask_name(current: str, *, language: str = "en") -> Optional[str]:
     """Show a Windows input box for a new device name.
     -> the new name, or None when the user cancels or leaves it empty.
 
-    The box comes from PowerShell (Microsoft.VisualBasic InputBox), which is on every
+    The box comes from PowerShell (Windows Forms), which is on every
     Windows. The current name goes to PowerShell in an environment variable, not in
     the command line, so quotes or other characters in a name do no harm."""
     if sys.platform != "win32":
         return None
-    script = ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
-              "Add-Type -AssemblyName Microsoft.VisualBasic; "
-              "[Microsoft.VisualBasic.Interaction]::InputBox("
-              "'New name for this device:', 'Halo Battery - Rename', $env:HALO_BATTERY_NAME)")
+    # Text stays out of the script, including translations containing apostrophes.
+    # AutoSize measures the prompt and buttons at the Windows DPI/font size.
+    script = """
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+$form = New-Object System.Windows.Forms.Form
+$form.Text = $env:HALO_BATTERY_TITLE
+$form.StartPosition = 'CenterScreen'
+$form.FormBorderStyle = 'FixedDialog'
+$form.MinimizeBox = $false; $form.MaximizeBox = $false
+$form.AutoSize = $true; $form.AutoSizeMode = 'GrowAndShrink'
+$layout = New-Object System.Windows.Forms.TableLayoutPanel
+$layout.AutoSize = $true; $layout.Dock = 'Fill'; $layout.Padding = 12
+$label = New-Object System.Windows.Forms.Label
+$label.Text = $env:HALO_BATTERY_PROMPT; $label.AutoSize = $true
+$tb = New-Object System.Windows.Forms.TextBox
+$tb.Text = $env:HALO_BATTERY_NAME; $tb.MaxLength = 60; $tb.Width = 340
+$buttons = New-Object System.Windows.Forms.FlowLayoutPanel
+$buttons.AutoSize = $true; $buttons.FlowDirection = 'RightToLeft'
+$ok = New-Object System.Windows.Forms.Button
+$ok.Text = $env:HALO_BATTERY_OK; $ok.AutoSize = $true; $ok.DialogResult = 'OK'
+$cancel = New-Object System.Windows.Forms.Button
+$cancel.Text = $env:HALO_BATTERY_CANCEL; $cancel.AutoSize = $true; $cancel.DialogResult = 'Cancel'
+$buttons.Controls.Add($cancel); $buttons.Controls.Add($ok)
+$layout.Controls.Add($label, 0, 0); $layout.Controls.Add($tb, 0, 1)
+$layout.Controls.Add($buttons, 0, 2); $form.Controls.Add($layout)
+$form.AcceptButton = $ok; $form.CancelButton = $cancel
+$form.Add_Shown({ $tb.Focus(); $tb.SelectAll() })
+if ($form.ShowDialog() -eq 'OK') { [Console]::WriteLine($tb.Text) }
+$form.Dispose()
+"""
     try:
         res = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            ["powershell", "-NoProfile", "-STA", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-Command", script],
             capture_output=True, timeout=600, creationflags=0x08000000,   # CREATE_NO_WINDOW
-            env=dict(os.environ, HALO_BATTERY_NAME=current))
+            env=dict(os.environ, HALO_BATTERY_NAME=current,
+                     HALO_BATTERY_TITLE=i18n.translate("rename.title", language=language),
+                     HALO_BATTERY_PROMPT=i18n.translate("rename.prompt", language=language),
+                     HALO_BATTERY_OK=i18n.translate("rename.ok", language=language),
+                     HALO_BATTERY_CANCEL=i18n.translate("rename.cancel", language=language)))
     except (OSError, subprocess.SubprocessError) as e:
         log.warning("rename: %s", e)
         return None
@@ -845,7 +1132,8 @@ class DeviceIcon:
         self._state = None                      # to avoid redrawing when nothing changed
         self._images: Dict[tuple, object] = {}  # state -> image or frames, per colour
         self.icon = tray_icon(key, f"{APP_NAME}_{abs(hash(key))}",
-                              icons.render(None, False, False, light_taskbar=app.light_taskbar),
+                              icons.render(None, False, False, light_taskbar=app.light_taskbar,
+                                           size=getattr(app, "tray_size", icons.SIZE)),
                               APP_TITLE, app.build_menu(self))
         self.icon._hb_flyout = getattr(app, "flyout", None)
         # pystray calls the setup function once the icon's window exists. The app shows
@@ -860,29 +1148,35 @@ class DeviceIcon:
             self._update(st)
 
     def _update(self, st: DeviceStatus) -> None:
+        paused_changed = bool(self.status and self.status.polling_paused) != st.polling_paused
         self.status = st
         badge = self.app.pictogram(st) if self.app.cfg["badges"] else ""
-        animate = (self.app.cfg["animation"] and st.charging and st.online
-                   and st.level is not None)
+        animate = self.app.cfg["animation"] and st.charging and st.online
         # the number replaces the pictogram; a device that only reports rough steps
         # (st.approx) keeps its pictogram rather than showing a made-up exact number
         text = (str(st.level) if self.app.cfg.get("percent_in_icon") and st.level is not None
                 and not st.approx else "")
-        state = (st.level, st.charging, st.online, self.app.low_for(st),
-                 self.app.light_taskbar, badge, animate, text)
+        brand, brand_color = self.app.controller_style(st)
+        state = (st.level, st.charging, st.online or st.polling_paused, self.app.low_for(st),
+                 self.app.light_taskbar, badge, animate, text, st.polling_paused,
+                 getattr(self.app, "tray_size", icons.SIZE), brand, brand_color)
         if state != self._state:
-            self._state = state
             art = self._art(state)
             if animate:
                 self.frames = art
                 self.icon.icon = art[self.app.anim_tick % len(art)]
+                wake = getattr(self.app, "anim_wake", None)
+                if wake is not None:
+                    wake.set()                  # anim_loop sleeps while nothing charges
             else:
                 self.frames = None
                 self.icon.icon = art
-        title = describe(st, self.app.display_name(st), self.app.time_left_text(st))
+        title = describe(st, self.app.display_name(st), self.app.time_left_text(st),
+                         language=self.app.cfg.get("language", "en"))
         # the tray tooltip is limited to 127 characters
-        if self.icon.title != title[:127]:
-            self.icon.title = title[:127]
+        title = i18n.tooltip(title)
+        if self.icon.title != title or paused_changed:
+            self.icon.title = title
             # pystray builds the Windows menu once and keeps its texts. The menu header
             # shows the same text as the tooltip, so rebuild the menu when it changes;
             # otherwise the header keeps "No devices found" from before the first reading
@@ -892,10 +1186,8 @@ class DeviceIcon:
                 pass
         ready = getattr(self, "ready", None)
         if not self.icon.visible and (ready is None or ready.wait(ICON_READY_TIMEOUT)):
-            try:
-                self.icon.visible = True
-            except Exception:
-                pass
+            self.icon.visible = True
+        self._state = state                     # commit only after native update/show succeeds
 
     def _art(self, state: tuple):
         """The image (or the charging frames) for a state. Only the colour in use is
@@ -904,16 +1196,19 @@ class DeviceIcon:
         draw anything again. The cache holds one state, in at most both colours."""
         art = self._images.get(state)
         if art is None:
-            level, charging, online, low, light, badge, animate, text = state
-            other = (level, charging, online, low, not light, badge, animate, text)
+            level, charging, online, low, light, badge, animate, text, paused, size, brand, color = state
+            other = (level, charging, online, low, not light, badge, animate, text, paused,
+                     size, brand, color)
             kept = self._images.get(other)
             self._images.clear()
             if kept is not None:
                 self._images[other] = kept      # the same state in the other colour
             if animate:
-                art = icons.charging_frames(level, online, low, light, badge, text=text)
+                art = icons.charging_frames(level, online, low, light, badge, text=text,
+                                            size=size, brand=brand, brand_color=color)
             else:
-                art = icons.render(level, charging, online, low, light, badge, text=text)
+                art = icons.render(level, charging, online, low, light, badge, text=text,
+                                   force_active=paused, size=size, brand=brand, brand_color=color)
             self._images[state] = art
         return art
 
@@ -971,19 +1266,22 @@ class WakeEvent(threading.Event):
 
 class App:
     def __init__(self):
-        self.cfg = load_config()
+        self.config_existed = os.path.exists(CONFIG_PATH)   # before language initialization
+        self.cfg = load_config(initialize_language=True)
         self.light_taskbar = False
         self.theme_evt = threading.Event()   # "re-check the icon colour now"
         self.win_events: Optional[winevents.WindowEventWatcher] = None
         self.light_taskbar = self.compute_light()
+        self.tray_size = tray_dpi.tray_pixels()
         self.providers = make_providers()
         self.key_provider: Dict[str, str] = {}   # device key -> provider name
         self.history = history.History(HISTORY_PATH)
         self.history.load()
-        self.held: Dict[tuple, tuple] = {}      # (key, title) -> (text, title), held while quiet
+        self.held: Dict[tuple, tuple] = {}      # (device key, kind) -> English text/title + parameters
         self.was_quiet = False
         self.bt = BluetoothProvider()
         self.icons: Dict[str, DeviceIcon] = {}
+        self.started = time.monotonic()
         self.placeholder: Optional[pystray.Icon] = None
         self.lock = threading.RLock()
         self._bt_dup_logged: Set[str] = set()   # Bluetooth copies already reported
@@ -994,31 +1292,67 @@ class App:
         self.low_sound_at: Dict[str, float] = {}   # key -> time.monotonic() of the last sound
         self.full_state: Dict[str, str] = {}   # key -> charging / full / idle
         self.missing: Dict[str, int] = {}
+        self.input_wake_at = 0.0               # last input-driven poll of a greyed device (#87)
         self.bt_cache: List[DeviceStatus] = []
         self.hid_results: List[DeviceStatus] = []   # the last poll, before the Bluetooth merge
         self.anim_tick = 0
+        self.anim_wake = threading.Event()    # an icon has started its charging frames
         self.bt_wake = threading.Event()      # "poll Bluetooth now"
         self.bt_fresh = threading.Event()     # fresh result for diagnostics
         self.bt_watch: Optional[BluetoothWatcher] = None
         self.bt_watch_failed = False
-        self.update: Optional[tuple] = None   # (version, release page) when a newer one exists
+        self.update: Optional[updates.Release] = None   # a newer release, when there is one
         self.update_wake = threading.Event()  # "check for updates now"
+        self.update_manual = False            # the check was asked for from the menu
+        self.update_progress: Optional[int] = None   # percent while the update downloads
+        self.update_lock = threading.Lock()   # one check or install at a time
+        self.install_ok, self.install_why = updates.can_install(
+            bool(getattr(sys, "frozen", False)), BASE_DIR)
         # the tray menu (flyout.py); None = pystray's classic menu
         self.flyout: Optional[flyout.FlyoutHost] = (
             flyout.FlyoutHost() if sys.platform == "win32" and self.cfg.get("fluent_menu", True) else None)
 
     # ---------------- menu
+    def tr(self, key: str, **params) -> str:
+        return i18n.translate(key, language=self.cfg.get("language", "en"), **params)
+
+    def set_language(self, language: str) -> None:
+        """Refresh presentation under the same lock as polls, without polling hardware."""
+        if language not in i18n.LANGUAGES:
+            return
+        with self.lock:
+            self.cfg["language"] = language
+            save_config(self.cfg)
+            for ic in list(self.icons.values()):
+                ic.icon.menu = self.build_menu(ic)
+                if ic.status is not None:
+                    ic.icon.title = i18n.tooltip(describe(ic.status, self.display_name(ic.status),
+                                                         self.time_left_text(ic.status), language=language))
+            if self.placeholder is not None:
+                self.placeholder.menu = self.build_menu(None)
+                self.placeholder.title = i18n.tooltip(self.tr("tooltip.no_devices", app=APP_TITLE))
+            self.refresh_menus()
+
     def build_menu(self, owner: Optional[DeviceIcon]) -> Menu:
+        host = getattr(self, "flyout", None)
+        if host is not None:
+            host.language = self.cfg.get("language", "en")
+        tr = self.tr
         # the flyout shows the state on the line below the name (flyout.HeaderItem)
         def header_title():
             if owner and owner.status:
                 return self.display_name(owner.status) or owner.status.name
             hidden = len(self._settings_map("hidden"))
-            return f"No devices shown ({hidden} hidden)" if hidden else "No devices found"
+            return tr("menu.none_shown", count=hidden) if hidden else tr("menu.no_devices")
 
         def header_detail():
             if owner and owner.status:
-                return device_state(owner.status, self.time_left_text(owner.status))
+                if owner.status.polling_paused:
+                    return (device_state(owner.status, language=self.cfg.get("language", "en"))
+                            + "; " + i18n.translate("state.polling_paused",
+                                                    language=self.cfg.get("language", "en")))
+                return device_state(owner.status, self.time_left_text(owner.status),
+                                    language=self.cfg.get("language", "en"))
             return ""
 
         def set_interval(sec):
@@ -1061,16 +1395,24 @@ class App:
         def toggle_autostart(icon, item):
             try:
                 if not set_autostart(not autostart_enabled()):
-                    icon.notify(TEMP_AUTOSTART_TEXT, "Start with Windows")
+                    icon.notify(tr("notification.temp_autostart"), tr("preferences.autostart"))
             except OSError as e:
                 log.warning("autostart: %s", e)
 
-        intervals = [(15, "15 s"), (30, "30 s"), (60, "1 min"), (120, "2 min"), (300, "5 min")]
-        themes = [("auto", "Automatic"), ("white", "White"), ("black", "Black")]
-        lows = [(0, "Off"), (10, "10%"), (15, "15%"), (20, "20%"), (25, "25%"), (30, "30%")]
+        intervals = [(seconds, tr("interval." + str(i)))
+                     for i, seconds in enumerate((15, 30, 60, 120, 300))]
+        themes = [(m, tr("choice." + m)) for m in ("auto", "white", "black")]
+        lows = [(0, tr("choice.off"))] + [(p, tr("state.level", level=p)) for p in (5, 10, 15, 20, 25, 30)]
+
+        def pick_language(language):
+            return lambda icon, item: self.set_language(language)
 
         def update_text(_item):
-            return f"Download v{self.update[0]}…" if self.update else "Download update…"
+            if not self.update:
+                return tr("menu.download_update")
+            return update_item_text(self.update.version, getattr(self, "install_ok", False),
+                                    getattr(self, "update_progress", None),
+                                    language=self.cfg.get("language", "en"))
 
         def renamed(_item):
             return bool(owner and owner.status and owner.status.key in self._settings_map("names"))
@@ -1082,6 +1424,22 @@ class App:
         def pick(value):
             # pystray accepts only actions with 0-2 parameters
             return lambda icon, item: self.set_pictogram(owner, value)
+
+        def controller_visible(_item):
+            return bool(owner and owner.status and self.pictogram(owner.status) in CONTROLLER_PICTOGRAMS)
+
+        def brand_picked(value):
+            return lambda _item: bool(owner and owner.status) and self.controller_style(owner.status)[0] == value
+
+        def pick_brand(value):
+            return lambda icon, item: self.set_controller_brand(owner, value)
+
+        def color_picked(_item):
+            return bool(owner and owner.status and self.controller_color(owner.status.key))
+
+        def flip_controller_color(icon, item):
+            if owner and owner.status:
+                self.set_controller_color(owner, not self.controller_color(owner.status.key))
 
         def show_again(key):
             # pystray accepts only actions with 0-2 parameters, so no "k=key" default here
@@ -1096,7 +1454,7 @@ class App:
 
         def default_low_text(_item):
             low = self.cfg["low"]
-            return f"Default ({low}%)" if low else "Default (off)"
+            return tr("menu.default_low", level=low) if low else tr("menu.default_off")
 
         def provider_on(name):
             return lambda _item: name not in self.disabled_providers()
@@ -1105,90 +1463,108 @@ class App:
             return lambda icon, item: self.toggle_provider(name)
 
         def provider_items():
-            for name, label in sorted(PROVIDER_LABELS.items(), key=lambda kv: kv[1].lower()):
+            labels = [(name, tr("provider." + name) if "provider." + name in i18n.LANGUAGES["en"].catalog
+                       else label) for name, label in PROVIDER_LABELS.items()]
+            for name, label in sorted(labels, key=lambda kv: kv[1].lower()):
                 yield Item(label, flip_provider(name), checked=provider_on(name))
 
         def hidden_items():
             # built each time the menu opens, so it always shows the current list
             hidden = self._settings_map("hidden")
             for key, name in sorted(hidden.items(), key=lambda kv: str(kv[1]).lower()):
-                yield Item(f"Show {name}", show_again(key))
+                yield Item(tr("menu.show", name=name), show_again(key))
 
         # items for the device of this icon only (the "no devices" icon has none)
         device_items = [
             # the flyout has the pencil next to the name instead
-            flyout.classic_only(Item("Rename…", lambda i, it: self.rename(owner))),
-            Item("Reset name", lambda i, it: self.reset_name(owner), visible=renamed),
-            Item("Icon", Menu(*[Item(label, pick(value), checked=picked(value), radio=True)
-                                for value, label in PICTOGRAM_CHOICES])),
-            Item("Low battery alert at", Menu(
+            flyout.classic_only(Item(tr("menu.rename"), lambda i, it: self.rename(owner))),
+            Item(tr("menu.reset_name"), lambda i, it: self.reset_name(owner), visible=renamed),
+            Item(tr("menu.icon"), Menu(*[Item(tr("icon." + value) if value else tr("choice.auto"),
+                                              pick(value), checked=picked(value), radio=True)
+                                       for value, _label in PICTOGRAM_CHOICES])),
+            Item(tr("menu.controller_logo"), Menu(
+                *[Item(tr("controller." + brand), pick_brand(brand),
+                       checked=brand_picked(brand), radio=True) for brand in CONTROLLER_BRANDS],
+                Menu.SEPARATOR,
+                Item(tr("controller.color"), flip_controller_color, checked=color_picked,
+                     visible=lambda it: bool(owner and owner.status and
+                                             self.controller_style(owner.status)[0] != "default"))),
+                 visible=controller_visible),
+            Item(tr("menu.device_low"), Menu(
                 Item(default_low_text, pick_device_low(None), checked=device_low_picked(None), radio=True),
                 *[Item(t, pick_device_low(p), checked=device_low_picked(p), radio=True)
                   for p, t in lows])),
-            Item("Hide this device", lambda i, it: self.hide(owner)),
+            Item(tr("menu.hide"), lambda i, it: self.hide(owner)),
         ] if owner is not None else []
 
         # all settings in one submenu, so the main menu keeps only the things used often
         preferences = Menu(
+            Item(tr("preferences.language"), Menu(*[
+                Item(details.name, pick_language(language), radio=True,
+                     checked=lambda it, language=language: self.cfg.get("language", "en") == language)
+                for language, details in i18n.LANGUAGES.items()])),
             # - / + in the menu; the classic menu shows them as a list to pick from
-            flyout.CounterItem("Poll interval", intervals, lambda: self.cfg["interval"], set_interval),
-            flyout.CounterItem("Low battery alert", lows, lambda: self.cfg["low"], set_low),
-            Item("Alert when fully charged", toggle("full_alert"),
+            flyout.CounterItem(tr("preferences.interval"), intervals, lambda: self.cfg["interval"], set_interval),
+            flyout.CounterItem(tr("preferences.low"), lows, lambda: self.cfg["low"], set_low),
+            Item(tr("preferences.full"), toggle("full_alert"),
                  checked=lambda it: self.cfg.get("full_alert", True)),
-            Item("Estimated time left", toggle("time_left"),
+            Item(tr("preferences.time_left"), toggle("time_left"),
                  checked=lambda it: self.cfg.get("time_left", True)),
-            Item("Quiet while gaming", toggle("quiet_fullscreen"),
+            Item(tr("preferences.quiet"), toggle("quiet_fullscreen"),
                  checked=lambda it: self.cfg.get("quiet_fullscreen", True)),
             # for full-screen games, where the notification is not seen (#66)
-            Item("Sound with the low battery alert", toggle("low_sound"),
+            Item(tr("preferences.low_sound"), toggle("low_sound"),
                  checked=lambda it: self.cfg.get("low_sound", False)),
+            Item(tr("preferences.keep_disconnected"), toggle("keep_disconnected"),
+                 checked=lambda it: self.cfg.get("keep_disconnected", False)),
             Menu.SEPARATOR,
-            Item("Windows Bluetooth devices", toggle("bluetooth"),
+            Item(tr("preferences.bluetooth"), toggle("bluetooth"),
                  checked=lambda it: self.cfg["bluetooth"]),
             # off: a PS4 / PS5 controller over Bluetooth shows its level only while Steam or a
             # game has it in the full mode; on: the app switches it, which some games do not
             # survive until the controller is turned off and on (#96)
-            Item("PlayStation full mode (Bluetooth)", toggle("playstation_full_mode"),
+            Item(tr("preferences.playstation"), toggle("playstation_full_mode"),
                  checked=lambda it: self.cfg.get("playstation_full_mode", False)),
-            Item("Device types", Menu(provider_items)),
-            Item("Device pictogram", toggle("badges"),
+            Item(tr("preferences.providers"), Menu(provider_items)),
+            Item(tr("preferences.badges"), toggle("badges"),
                  checked=lambda it: self.cfg["badges"]),
-            Item("Percentage in the icon", toggle("percent_in_icon"),
+            Item(tr("preferences.percent"), toggle("percent_in_icon"),
                  checked=lambda it: self.cfg.get("percent_in_icon", False)),
-            Item("Charging animation", toggle("animation"),
+            Item(tr("preferences.animation"), toggle("animation"),
                  checked=lambda it: self.cfg["animation"]),
-            Item("Icon colour", Menu(*[
+            Item(tr("preferences.theme"), Menu(*[
                 Item(t, set_theme(m), checked=lambda it, m=m: self.cfg.get("icon_theme", "auto") == m, radio=True)
                 for m, t in themes])),
             Menu.SEPARATOR,
-            Item("Status file for other apps", toggle("status_file"),
+            Item(tr("preferences.status_file"), toggle("status_file"),
                  checked=lambda it: self.cfg.get("status_file", False)),
-            Item("Start with Windows", toggle_autostart,
+            Item(tr("preferences.autostart"), toggle_autostart,
                  checked=lambda it: autostart_enabled()),
-            Item("Check for updates", toggle("update_check"),
+            Item(tr("preferences.updates"), toggle("update_check"),
                  checked=lambda it: self.cfg.get("update_check", True)),
+            Item(tr("preferences.check_now"), lambda i, it: self.check_update_now()),
         )
 
         return Menu(
             flyout.HeaderItem(header_title, header_detail,
                               edit=(lambda icon: self.rename(owner)) if owner is not None else None),
-            Item(update_text, lambda i, it: self.open_update(),
+            Item(update_text, lambda i, it: self.start_update(),
                  visible=lambda it: self.update is not None),
             *device_items,
             Menu.SEPARATOR,
-            Item("Refresh now", lambda i, it: self.wake.set(), default=True),
-            Item("Preferences", preferences),
-            Item("Hidden devices", Menu(hidden_items),
+            Item(tr("menu.refresh"), lambda i, it: self.wake.set(), default=True),
+            Item(tr("menu.preferences"), preferences),
+            Item(tr("menu.hidden"), Menu(hidden_items),
                  visible=lambda it: bool(self._settings_map("hidden"))),
             Menu.SEPARATOR,
-            Item("Diagnostics…", lambda i, it: self.request_diag()),
-            Item(f"Exit (v{VERSION})", lambda i, it: self.quit()),
+            Item(tr("menu.diagnostics"), lambda i, it: self.request_diag()),
+            Item(tr("menu.exit", version=VERSION), lambda i, it: self.quit()),
         )
 
     # ---------------- hide / rename
-    def _settings_map(self, key: str) -> Dict[str, str]:
+    def _settings_map(self, key: str) -> Dict[str, object]:
         """cfg["hidden"] or cfg["names"] (device key -> name), or cfg["icons"] (device
-        key -> pictogram). A value that is not a dict (a hand-edited or damaged settings
+        key -> pictogram), and controller brand/colour maps. A value that is not a dict (a hand-edited or damaged settings
         file) is replaced by an empty one."""
         value = self.cfg.get(key)
         if not isinstance(value, dict):
@@ -1237,7 +1613,7 @@ class App:
         st = owner.status
         if st is None:
             return
-        new = ask_name(self.display_name(st))
+        new = ask_name(self.display_name(st), language=self.cfg.get("language", "en"))
         if new is None or new == self.display_name(st):
             return
         with self.lock:
@@ -1266,13 +1642,15 @@ class App:
     def pictogram(self, st: DeviceStatus) -> str:
         """The pictogram the user picked for this device, or the automatic one."""
         choice = self._settings_map("icons").get(st.key)
-        if isinstance(choice, str) and choice in icons.PICTOS:
+        if isinstance(choice, str) and choice in icons.PICTOGRAM_KINDS:
             return choice
         return badge_for(st)
 
     def set_pictogram(self, owner: Optional[DeviceIcon], value: str) -> None:
         """"Icon" in the device menu: "" goes back to the automatic pictogram."""
         if owner is None or owner.status is None:
+            return
+        if not isinstance(value, str) or (value and value not in icons.PICTOGRAM_KINDS):
             return
         with self.lock:
             chosen = self._settings_map("icons")
@@ -1283,6 +1661,45 @@ class App:
             save_config(self.cfg)
         log.info("icon of [%s]: %s", owner.status.key, value or "automatic")
         owner.update(owner.status)            # redraw at once
+        self.refresh_menus()
+
+    def controller_color(self, key: str) -> bool:
+        """Only a real boolean enables the per-device logo colour."""
+        return self._settings_map("controller_colors").get(key) is True
+
+    def controller_style(self, st: DeviceStatus) -> tuple:
+        """Presentation only: pictogram/status.json keep their existing device kind."""
+        if self.pictogram(st) not in CONTROLLER_PICTOGRAMS:
+            return "default", False
+        brand = self._settings_map("controller_brands").get(st.key, "default")
+        if not isinstance(brand, str) or brand not in CONTROLLER_BRANDS:
+            brand = "default"
+        return brand, brand != "default" and self.controller_color(st.key)
+
+    def set_controller_brand(self, owner: Optional[DeviceIcon], brand: str) -> None:
+        if owner is None or owner.status is None or brand not in CONTROLLER_BRANDS:
+            return
+        with self.lock:
+            chosen = self._settings_map("controller_brands")
+            if brand == "default":
+                chosen.pop(owner.status.key, None)
+            else:
+                chosen[owner.status.key] = brand
+            save_config(self.cfg)
+        owner.update(owner.status)
+        self.refresh_menus()
+
+    def set_controller_color(self, owner: Optional[DeviceIcon], enabled: bool) -> None:
+        if owner is None or owner.status is None or not isinstance(enabled, bool):
+            return
+        with self.lock:
+            chosen = self._settings_map("controller_colors")
+            if enabled:
+                chosen[owner.status.key] = True
+            else:
+                chosen.pop(owner.status.key, None)
+            save_config(self.cfg)
+        owner.update(owner.status)
         self.refresh_menus()
 
     # ---------------- low battery alert per device
@@ -1355,12 +1772,13 @@ class App:
         self.wake.set()
 
     # ---------------- time left
-    def time_left_text(self, st: DeviceStatus) -> str:
+    def time_left_text(self, st: DeviceStatus, *, language: Optional[str] = None) -> str:
         """"about 5 h of use left", or "" when turned off or not known yet."""
-        if not self.cfg.get("time_left", True) or st.approx:
+        if not self.cfg.get("time_left", True) or st.approx or not st.charging_known:
             return ""
         seconds = self.history.seconds_left(st.key, st.level)
-        return history.format_left(seconds) if seconds is not None else ""
+        return i18n.format_left(seconds, language=language if language is not None else
+                                self.cfg.get("language", "en")) if seconds is not None else ""
 
     # ---------------- icon colour
     def compute_light(self) -> bool:
@@ -1381,14 +1799,35 @@ class App:
 
     def refresh_theme(self) -> None:
         light = self.compute_light()
-        if light == self.light_taskbar:
-            return
-        self.light_taskbar = light
-        for ic in list(self.icons.values()):
-            if ic.status is not None:
-                ic.update(ic.status)            # the state key includes the colour -> redraw
-        if self.placeholder is not None:
-            self.placeholder.icon = icons.render(None, False, False, light_taskbar=light)
+        size = tray_dpi.tray_pixels()
+        with self.lock:
+            resized = size != getattr(self, "tray_size", icons.SIZE)
+            if light == self.light_taskbar and not resized:
+                return
+            previous = self.light_taskbar, getattr(self, "tray_size", icons.SIZE)
+            self.light_taskbar, self.tray_size = light, size
+            try:
+                for ic in list(self.icons.values()):
+                    if ic.status is not None:
+                        if resized:
+                            ic.frames = None
+                            ic._images.clear()
+                            ic._state = None
+                        ic.update(ic.status)
+                        if resized:
+                            discard = getattr(getattr(ic, "icon", None), "discard_cached_handles", None)
+                            if discard is not None:
+                                discard()
+                if self.placeholder is not None:
+                    self.placeholder.icon = icons.render(None, False, False, light_taskbar=light, size=size)
+                    if resized:
+                        discard = getattr(self.placeholder, "discard_cached_handles", None)
+                        if discard is not None:
+                            discard()
+            except Exception:
+                # theme_loop will retry the remaining swaps on its next tick.
+                self.light_taskbar, self.tray_size = previous
+                raise
         log.info("icon colour: %s (%s%s)", "black" if light else "white", self.cfg.get("icon_theme"),
                  ", MyDockFinder" if icons.mydockfinder_running() else "")
 
@@ -1530,6 +1969,8 @@ class App:
                 continue          # turned off in Preferences > Device types: not opened at all
             if isinstance(p, PlayStationProvider):
                 p.switch_bluetooth = bool(self.cfg.get("playstation_full_mode", False))
+            if isinstance(p, AtkKeyboardProvider):
+                p.activity.wake = self.wake.set
             try:
                 found = p.poll()
             except Exception:
@@ -1620,14 +2061,21 @@ class App:
                 if st.key in hidden:
                     continue      # hidden by the user: no icon and no low battery alert
                 seen.add(st.key)
-                self.history.record(st.key, st.level, st.charging, st.online, now,
+                self.history.record(st.key, st.level, st.charging,
+                                    st.online and st.charging_known, now,
                                     coarse=bool(st.approx))
                 self.missing.pop(st.key, None)
                 ic = self.icons.get(st.key)
-                if ic is None:
-                    ic = DeviceIcon(self, st.key)
-                    self.icons[st.key] = ic
-                ic.update(st)
+                try:
+                    if ic is None:
+                        ic = DeviceIcon(self, st.key)
+                        self.icons[st.key] = ic
+                    ic.update(st)
+                except Exception as e:
+                    # A failed native swap must not discard the other readings
+                    # or prevent missing-device cleanup in this poll cycle.
+                    log.warning("tray: update %s: %s", st.key, e)
+                    continue
             self.check_alert(ic, st)
             self.check_full(ic, st)
 
@@ -1637,13 +2085,26 @@ class App:
         # presence comes from the reliable HID list (and its key switches between
         # the cable-only and Bluetooth forms when a cable is added to a BT pad),
         # so those go at once
+        keep = bool(self.cfg.get("keep_disconnected", False))
         gone = []
         with self.lock:
             for key in list(self.icons):
                 if key not in seen and (may_go is None or may_go(key)):
+                    st = self.icons[key].status
+                    if (keep and st is not None and not st.online and not st.polling_paused
+                            and key not in self.missing):
+                        continue      # already kept: greyed with its last level
                     self.missing[key] = self.missing.get(key, 0) + 1
                     limit = 1 if key.startswith(("xinput:", "bt:", "ps:")) else 2
-                    if self.missing[key] >= limit:
+                    if self.missing[key] >= limit and keep and st is not None:
+                        # "keep disconnected devices": grey icon, last level, no alerts
+                        try:
+                            self.icons[key].update(replace(st, online=False, charging=False, polling_paused=False))
+                        except Exception as e:
+                            log.warning("tray: disconnect %s: %s", key, e)
+                            continue    # retain the missing marker so this image is retried
+                        self.missing.pop(key, None)
+                    elif self.missing[key] >= limit:
                         gone.append(self.icons.pop(key))
                         # the icon is gone: stop counting, otherwise the quick
                         # 3-second re-check in wait_next() would go on forever
@@ -1668,8 +2129,9 @@ class App:
                 return
             ready = threading.Event()
             self.placeholder = tray_icon(IDLE_KEY, f"{APP_NAME}_idle",
-                                         icons.render(None, False, False, light_taskbar=self.light_taskbar),
-                                         f"{APP_TITLE}: no devices found",
+                                         icons.render(None, False, False, light_taskbar=self.light_taskbar,
+                                                      size=getattr(self, "tray_size", icons.SIZE)),
+                                         i18n.tooltip(self.tr("tooltip.no_devices", app=APP_TITLE)),
                                          self.build_menu(None))
             self.placeholder._hb_flyout = getattr(self, "flyout", None)
             self.placeholder_ready = ready
@@ -1686,7 +2148,7 @@ class App:
 
     def check_alert(self, ic: DeviceIcon, st: DeviceStatus):
         low = self.low_for(st)
-        if not low or st.level is None or not st.online:
+        if not low or st.level is None or not st.online or not st.charging_known:
             return
         if st.charging or st.level > low + 5:
             self.alerted[st.key] = False
@@ -1697,7 +2159,8 @@ class App:
             try:
                 self.notify(ic.icon, st.key,
                             low_battery_text(self.display_name(st), st.level, bool(st.approx)),
-                            "Low battery")
+                            "Low battery", kind="low",
+                            params={"name": self.display_name(st), "level": st.level, "approx": bool(st.approx)})
             except Exception as e:
                 log.warning("notify: %s", e)
         self.check_low_sound(st, low)
@@ -1705,6 +2168,8 @@ class App:
     def check_low_sound(self, st: DeviceStatus, low: int) -> None:
         """"Sound with the low battery alert": a Windows sound with the notification, and
         again every 5 minutes while the device stays low, awake and off the charger."""
+        if not st.charging_known:
+            return
         if not self.cfg.get("low_sound", False):
             self.low_sound_at.pop(st.key, None)
             return
@@ -1723,13 +2188,13 @@ class App:
         "charging" when they are full, so 100 % right after charging counts too. A level
         that goes 100 -> 99 -> 100 on the charger does not give a second one: the alert
         comes again only after the device leaves the charger or drops below 95 %."""
-        if st.level is None or not st.online:
+        if st.level is None or not st.online or not st.charging_known:
             return
         prev = self.full_state.get(st.key)
         if st.level >= 100 and prev == "charging" and self.cfg.get("full_alert", True):
             try:
                 self.notify(ic.icon, st.key, fully_charged_text(self.display_name(st)),
-                            "Fully charged")
+                            "Fully charged", kind="full", params={"name": self.display_name(st)})
             except Exception as e:
                 log.warning("notify: %s", e)
         if st.level >= 100:
@@ -1801,6 +2266,21 @@ class App:
                     xs = None
         return (self.usb_signature(), xs)
 
+    def stale_device_shown(self) -> bool:
+        """True while a greyed reading is one that new input can wake - the provider
+        marks those (a sleeping receiver mouse is awake by the time its first movement
+        lands in GetLastInputInfo). wait_next() uses this to decide whether the user
+        coming back is worth a poll at once. A device that is greyed because it is
+        *off* (a headset waiting for its power button, an icon brought back by the
+        "keep disconnected devices" option) is deliberately not one of these: firing a
+        full poll on every keystroke, all day, was too wide a gate (review by
+        @ahmedkhursheed23, #202)."""
+        for ic in list(self.icons.values()):
+            st = getattr(ic, "status", None)
+            if st is not None and not st.online and getattr(st, "wake_on_input", False):
+                return True
+        return False
+
     def wait_next(self, sig=None):
         """Wait for the next scheduled poll, but wake up early when a device is
         plugged in, unplugged, switched on or off."""
@@ -1810,6 +2290,9 @@ class App:
             interval = min(interval, 3)   # a new controller has no battery info yet: re-check soon
         if any(self.missing.values()):
             interval = min(interval, 3)   # a device just went missing: confirm quickly instead of in a minute
+        started = getattr(self, "started", None)
+        if started is not None and startup_retry_due(not self.icons, time.monotonic() - started):
+            interval = min(interval, STARTUP_RETRY_INTERVAL)   # receivers may still be waking up (#214)
         quiet = self.quiet()
         if quiet:
             # a game is full screen: every poll talks to the devices, so do it rarely.
@@ -1818,6 +2301,7 @@ class App:
         deadline = time.time() + interval
         if sig is None:
             sig = self.change_signature()
+        prev_input = last_input_ms()
         while not self.stop_evt.is_set():
             left = deadline - time.time()
             if left <= 0:
@@ -1837,11 +2321,39 @@ class App:
                 return
             if quiet and not self.quiet():
                 return                   # the game is closed: poll now and show what was held
+            if not quiet:
+                # the user is at the PC: a sleeping mouse is awake by the time its
+                # first movement lands here, so a greyed (asleep) reading is re-read
+                # at once instead of up to a minute later. That first input is the
+                # instant re-read. And while input simply keeps coming - the mouse
+                # can sleep during touchpad use, so when the hand comes back there
+                # was no pause for the old gate to see (#87) - a poll every few
+                # seconds notices the waking too, without a tight poll loop.
+                # Only readings whose provider marks them wake-on-input take part:
+                # an icon greyed because its device is off stays quiet (#202 review).
+                in_now = last_input_ms()
+                if in_now is not None:
+                    if in_now != prev_input and self.stale_device_shown() \
+                            and time.time() - self.input_wake_at >= INPUT_WAKE_GAP:
+                        self.input_wake_at = time.time()
+                        log.info("input while a reading is greyed: polling at once (#87)")
+                        return
+                    prev_input = in_now
 
     def anim_loop(self):
-        """Advances the "breathing" frames of charging devices; other icons are left alone."""
+        """Advances charging frames at 30 FPS; other icons are left alone.
+        While nothing charges, the thread sleeps until an icon starts its frames instead of
+        waking for animation ticks with nothing to animate."""
         step = icons.BREATH_PERIOD / icons.BREATH_FRAMES
-        while not self.stop_evt.wait(step):
+        while not self.stop_evt.is_set():
+            self.anim_wake.clear()      # before the check: frames set after it wake the wait
+            if self.stop_evt.is_set():
+                return
+            if not any(ic.frames for ic in list(self.icons.values())):
+                self.anim_wake.wait()   # DeviceIcon._update or quit() sets it
+                continue
+            if self.stop_evt.wait(step):
+                return
             self.anim_tick += 1
             for ic in list(self.icons.values()):
                 ic.tick(self.anim_tick)
@@ -1858,12 +2370,12 @@ class App:
             except Exception:
                 pass
 
-    def notify_any(self, text: str, title: str, key: str = "") -> None:
+    def notify_any(self, text: str, title: str, key: str = "", *, kind: str = "", params=None) -> None:
         """A tray notification from whichever icon is there."""
         icon = next((ic.icon for ic in list(self.icons.values())), None) or self.placeholder
         if icon is not None:
             try:
-                self.notify(icon, key, text, title)
+                self.notify(icon, key, text, title, kind=kind, params=params)
             except Exception as e:
                 log.warning("notify: %s", e)
 
@@ -1877,19 +2389,20 @@ class App:
             if st.key in hidden:
                 continue
             secs = None if st.approx else self.history.seconds_left(st.key, st.level)
-            if st.charging or not st.online:
+            if st.charging or not st.online or not st.charging_known:
                 secs = None
             devices.append({
                 "key": st.key,
                 "name": self.display_name(st),
                 "level": st.level,
                 "charging": st.charging,
+                "charging_known": st.charging_known,
                 "online": st.online,
                 "kind": self.pictogram(st),
                 "approx": st.approx or None,
                 "low_alert_at": self.low_for(st),
                 "seconds_left": None if secs is None else int(secs),
-                "text": describe(st, self.display_name(st), self.time_left_text(st)),
+                "text": describe(st, self.display_name(st), self.time_left_text(st, language="en")),
             })
         now = time.time()
         return {"app": APP_TITLE, "version": VERSION, "running": running,
@@ -1905,30 +2418,48 @@ class App:
         """True while "Quiet while gaming" is on and a full-screen app is in front."""
         return bool(self.cfg.get("quiet_fullscreen", True)) and fullscreen_app_running()
 
-    def notify(self, icon, key: str, text: str, title: str) -> None:
+    def notify(self, icon, key: str, text: str, title: str, *, kind: str = "", params=None) -> None:
         """Show a notification now, or hold it until the full-screen app is gone. Only
         the newest one per device and kind is kept, so a long game ends with one
-        "Low battery" per device rather than a pile of them."""
-        if self.quiet():
-            self.held[(key, title)] = (text, title)
-            log.info("held while full screen: %s", text)
-            return
-        icon.notify(text, title)
+        "Low battery" per device rather than a pile of them. English text/title
+        remain available for logs; kind/params are rendered in the selected
+        language only on delivery, including after a game."""
+        with self.lock:
+            if self.quiet():
+                self.held[(key, kind or title)] = (text, title, kind, dict(params or {}))
+                log.info("held while full screen: %s", text)
+                return
+            language = self.cfg.get("language", "en")
+            if kind == "low":
+                text = low_battery_text(**params, language=language)
+                title = self.tr("notification.low_title")
+            elif kind == "full":
+                text = fully_charged_text(**params, language=language)
+                title = self.tr("notification.full_title")
+            elif kind == "update":
+                text = update_text(params["version"], params.get("install", False), language=language)
+                title = self.tr("notification.update_title", app=APP_TITLE)
+            elif kind.startswith("notification.update_"):
+                text = i18n.translate(kind, language=language, **params)
+                title = self.tr("notification.update_title", app=APP_TITLE)
+            icon.notify(text, title)
 
     def flush_held(self) -> None:
         """The full-screen app is gone: show what was held, except a low battery alert
         for a device that has been put on the charger (or topped up) since."""
-        held, self.held = self.held, {}
-        for (key, title), (text, _) in held.items():
+        with self.lock:
+            held, self.held = self.held, {}
+        for (key, notice_kind), (text, title, kind, params) in held.items():
             ic = self.icons.get(key)
             st = ic.status if ic is not None else None
-            if title == "Low battery" and st is not None and (
-                    st.charging or (st.level is not None and st.level > self.low_for(st))):
+            if notice_kind in ("low", "Low battery") and st is not None and (
+                    not st.charging_known or st.charging or
+                    (st.level is not None and st.level > self.low_for(st))):
                 continue
-            self.notify_any(text, title, key)
+            self.notify_any(text, title, key, kind=kind, params=params)
 
     def open_update(self) -> None:
-        url = self.update[1] if self.update else updates.RELEASES_URL
+        url = self.update.url if self.update else updates.RELEASES_URL
         try:
             import webbrowser
             webbrowser.open(url)
@@ -1936,43 +2467,165 @@ class App:
             log.warning("open %s: %s", url, e)
 
     def update_loop(self):
-        """Once a day ask GitHub for the latest release; nothing is downloaded or
-        installed, the menu only offers the release page."""
+        """Once a day ask GitHub for the latest release; "Check for updates now" wakes
+        it at once. After an update: clean up and show "What's new"."""
         # what the last check found is shown right away, without waiting for the network
+        if updates.invalidate_cache_for_repo(self.cfg):
+            save_config(self.cfg)                # an offer cached from another repository is dropped
         seen = self.cfg.get("update_latest", "")
         if self.cfg.get("update_check", True) and updates.is_newer(seen, VERSION):
-            self.update = (seen, self.cfg.get("update_url") or updates.RELEASES_URL)
+            self.update = updates.Release(seen, self.cfg.get("update_url") or updates.RELEASES_URL)
+        self.after_update()
         if self.stop_evt.wait(30):               # let the icons come up first
             return
+        staging = self.cfg.pop("update_staging", None)
+        if getattr(sys, "frozen", False):            # never in a source folder
+            updates.cleanup(BASE_DIR, staging)
         while not self.stop_evt.is_set():
-            last = float(self.cfg.get("update_last", 0) or 0)
-            if self.cfg.get("update_check", True) and time.time() - last >= updates.CHECK_EVERY:
-                self.check_update()
-            self.update_wake.wait(3600)
+            # cleared before the check: a click on "Check for updates now" during the
+            # check wakes the next round instead of being lost
             self.update_wake.clear()
+            try:
+                last = float(self.cfg.get("update_last", 0) or 0)
+            except (TypeError, ValueError):      # a hand-edited settings file: check now
+                last = 0.0
+            manual, self.update_manual = self.update_manual, False
+            if manual or (self.cfg.get("update_check", True)
+                          and time.time() - last >= updates.CHECK_EVERY):
+                self.check_update(manual)
+            self.update_wake.wait(3600)
 
-    def check_update(self) -> None:
+    def check_update_now(self) -> None:
+        """Menu: "Check for updates now", whether or not the daily check is on."""
+        self.update_manual = True
+        self.update_wake.set()
+
+    def notify_update(self, key: str, **params) -> None:
+        # English for logs; translate at delivery if held while gaming.
+        text = i18n.translate(key, **params)
+        self.notify_any(text, f"{APP_TITLE} update", kind=key, params=params)
+
+    def check_update(self, manual: bool = False) -> None:
         try:
-            latest, url = updates.fetch_latest(VERSION)
+            rel = updates.fetch_latest(VERSION)
         except Exception as e:
             log.info("update check failed: %s", e)   # offline, rate limit: try again later
             self.cfg["update_last"] = time.time() - updates.CHECK_EVERY + 3 * 3600
             save_config(self.cfg)
+            if manual:
+                self.notify_update("notification.update_check_failed", error=str(e))
             return
-        self.cfg.update(update_last=time.time(), update_latest=latest, update_url=url)
-        if updates.is_newer(latest, VERSION):
-            log.info("update available: v%s (running v%s)", latest, VERSION)
-            self.update = (latest, url)
+        self.cfg.update(update_last=time.time(), update_latest=rel.version, update_url=rel.url,
+                        update_repo=updates.REPO)
+        if updates.is_newer(rel.version, VERSION):
+            log.info("update available: v%s (running v%s)", rel.version, VERSION)
+            self.update = rel
             self.refresh_menus()
-            if self.cfg.get("update_notified") != latest:
-                self.cfg["update_notified"] = latest
-                self.notify_any(update_text(latest), f"{APP_TITLE} update")
+            if manual or self.cfg.get("update_notified") != rel.version:
+                self.cfg["update_notified"] = rel.version
+                self.notify_any(update_text(rel.version, self.install_ok), f"{APP_TITLE} update", kind="update",
+                                params={"version": rel.version, "install": self.install_ok})
         else:
             self.update = None
+            self.refresh_menus()
+            if manual:
+                self.notify_update("notification.update_current", version=VERSION)
         save_config(self.cfg)
+
+    # ---------------- installing an update
+    def start_update(self) -> None:
+        """Menu: "Update to vX.Y.Z". The built app downloads and installs it; from
+        source, or in a folder it cannot write to, the release page opens instead."""
+        if not self.install_ok:
+            log.info("update: opening the release page (%s)", self.install_why)
+            self.open_update()
+            return
+        if self.update_progress is not None:
+            return                                   # already downloading
+        self.update_progress = 0
+        threading.Thread(target=self.install_update, daemon=True).start()
+
+    def install_update(self) -> None:
+        rel = self.update
+        try:
+            with self.update_lock:
+                if rel is None or not rel.zip_url:   # only the version is known (the last check)
+                    rel = updates.fetch_latest(VERSION)
+                    if not updates.is_newer(rel.version, VERSION):
+                        raise ValueError(f"v{VERSION} is already the latest version")
+                    self.update = rel
+                self.notify_update("notification.update_downloading", version=rel.version)
+                staging = updates.staging_dir()
+                new_app = updates.download(rel, staging, VERSION, progress=self._update_progress)
+                self.cfg.update(update_from=VERSION, update_staging=staging,
+                                whats_new_notes={"version": rel.version, "notes": rel.notes,
+                                                 "url": rel.url, "date": rel.published})
+                save_config(self.cfg)
+                log.info("update: v%s downloaded, restarting to install it", rel.version)
+                runner = updates.prepare_runner(BASE_DIR, staging)
+                updates.start_detached(
+                    updates.finish_command(runner, new_app, BASE_DIR, os.getpid()), cwd=runner)
+        except Exception as e:
+            log.warning("update failed: %s", e)
+            self.update_progress = None
+            self.refresh_menus()
+            self.notify_update("notification.update_failed", error=str(e))
+            self.open_update()
+            return
+        self.quit()                                  # the runner waits for this exit
+
+    def _update_progress(self, pct: int) -> None:
+        self.update_progress = pct
+
+    # ---------------- after an update: "What's new"
+    def after_update(self) -> None:
+        """Remember the running version; when it is newer than the one that ran before,
+        show the "What's new" window once."""
+        if PRETEND_VERSION:
+            return
+        prev = self.cfg.get("last_version")
+        from_version = self.cfg.pop("update_from", None)
+        if prev != VERSION or from_version:
+            self.cfg["last_version"] = VERSION
+            save_config(self.cfg)
+        if prev is None:
+            # settings from a version before 1.15.0, which did not note its version
+            upgraded = bool(getattr(self, "config_existed", False))
+        else:
+            upgraded = updates.is_newer(VERSION, prev)
+        if upgraded and self.cfg.get("whats_new", True):
+            self.show_whats_new(from_version or prev or "")
+
+    def show_whats_new(self, from_version: str = "") -> None:
+        notes = self.cfg.pop("whats_new_notes", None)
+        if not isinstance(notes, dict) or notes.get("version") != VERSION or not notes.get("notes"):
+            try:
+                rel = updates.fetch_release(VERSION, VERSION)
+                notes = {"version": rel.version, "notes": rel.notes, "url": rel.url,
+                         "date": rel.published}
+            except Exception as e:
+                log.info("what's new: release notes not available (%s)", e)
+                notes = {"version": VERSION, "notes": "", "url": updates.RELEASES_URL, "date": ""}
+        save_config(self.cfg)
+        host = self.flyout
+        if host is None:
+            host = self.flyout_dialogs = flyout.FlyoutHost()
+        whatsnew.show(host, VERSION, notes.get("notes", ""), notes.get("url") or updates.RELEASES_URL,
+                      from_version=from_version, date=notes.get("date", ""), open_url=self.open_url,
+                      language=self.cfg.get("language", "en"))
+
+    def open_url(self, url: str) -> None:
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception as e:
+            log.warning("open %s: %s", url, e)
 
     def quit(self):
         self.stop_evt.set()
+        for provider in self.providers:
+            if isinstance(provider, AtkKeyboardProvider):
+                provider.close()
         self.history.save(force=True)
         if self.cfg.get("status_file"):
             try:
@@ -1980,6 +2633,7 @@ class App:
             except OSError as e:
                 log.warning("status file: %s", e)
         self.update_wake.set()
+        self.anim_wake.set()
         self.theme_evt.set()
         if self.win_events is not None:
             self.win_events.stop()
@@ -2029,8 +2683,45 @@ def dump_hid() -> List[str]:
     return lines
 
 
+def _probe_emit(sections):
+    """Show the probe's output.
+
+    In a console this prints. Without one - a windowed build started plainly,
+    where `print()` goes nowhere - the text goes to `HaloBattery-probe.txt`
+    next to the executable and is opened with the default editor, so a probe
+    run is never silent (this is how the first probe build looked blank in #28).
+    """
+    text = "\n".join(sections)
+    if sys.stdout is not None:
+        try:
+            print(text)
+            return None
+        except (OSError, ValueError):
+            pass
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.getcwd()
+    path = os.path.join(base, "HaloBattery-probe.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    except OSError:
+        path = os.path.join(tempfile.gettempdir(), "HaloBattery-probe.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    try:
+        os.startfile(path)
+    except OSError:
+        pass
+    return path
+
+
 def probe():
     """Console mode: a single poll with verbose output."""
+    # providers can deepen their diagnostics for this run (the Corsair receiver
+    # family logs every write and every frame; see #28)
+    os.environ["HALO_PROBE"] = "1"
     # device names come from Windows and may contain any characters; a cp1252
     # console would otherwise crash on them
     for stream in (sys.stdout, sys.stderr):
@@ -2043,28 +2734,68 @@ def probe():
     app.providers = make_providers(jbl_listen_first=JBL_PROBE_LISTEN_S)
     app.bt = BluetoothProvider()
     res = []
+    sections = []
     for p in app.providers + [app.bt]:
         if isinstance(p, PlayStationProvider):
             p.switch_bluetooth = bool(app.cfg.get("playstation_full_mode", False))
         res += p.poll()
-        print("\n".join(p.diagnostics()))
-    print("\n=== Summary ===")
+        sections.append("\n".join(p.diagnostics()))
+    sections.append("\n=== Summary ===")
     for s in res:
-        print(describe(s))
+        sections.append(describe(s))
     if not res:
-        print("Nothing found.")
+        sections.append("Nothing found.")
     # always list every HID device: the case worth dumping is a device that did
     # not answer while others did, and that never reaches the branch above
-    print("\nAll HID devices:")
-    print("\n".join(dump_hid()))
+    sections.append("\nAll HID devices:")
+    sections.append("\n".join(dump_hid()))
+    _probe_emit(sections)
+
+
+def show_whats_new_only() -> None:
+    """--whats-new: show the "What's new" window of this version and exit (no tray)."""
+    app = App.__new__(App)
+    app.cfg = load_config()
+    app.flyout = None
+    host = flyout.FlyoutHost()
+    try:
+        rel = updates.fetch_release(VERSION, VERSION)
+        notes, url, date = rel.notes, rel.url, rel.published
+    except Exception as e:
+        log.info("what's new: release notes not available (%s)", e)
+        notes, url, date = "", updates.RELEASES_URL, ""
+    closed = whatsnew.show(host, VERSION, notes, url, from_version="", date=date,
+                           open_url=app.open_url, language=app.cfg.get("language", "en"))
+    closed.wait()
+    host.stop()
 
 
 def main():
+    global VERSION, PRETEND_VERSION
     # before any window exists: without it Windows draws the app at 100 % and
     # stretches it on a scaled screen, which made the menu text small and blurry
     flyout.enable_dpi_awareness()
     if "--probe" in sys.argv:
         probe()
+        return
+    try:
+        finish = updates.parse_finish_args(sys.argv)
+    except ValueError as e:
+        log.error("update: %s", e)
+        return
+    if finish is not None:
+        # a copy of this app in %TEMP%: put the downloaded version in place and start it
+        app_dir, new_app, pid = finish
+        log.info("update: installing %s into %s (old pid %d)", new_app, app_dir, pid)
+        updates.finish_update(app_dir, pid, new_app)
+        return
+    if "--pretend-version" in sys.argv:
+        i = sys.argv.index("--pretend-version")
+        if i + 1 < len(sys.argv) and updates.parse_version(sys.argv[i + 1]):
+            PRETEND_VERSION = VERSION = sys.argv[i + 1].lstrip("vV")
+            log.info("pretending to be v%s (update test)", VERSION)
+    if "--whats-new" in sys.argv:
+        show_whats_new_only()
         return
     if not single_instance():
         return
@@ -2076,6 +2807,8 @@ def main():
         log.info("autostart entry migrated from %s", LEGACY_NAME)
     elif refresh_autostart():
         log.info("autostart entry now points at %s", sys.executable)
+    if sync_installed_version():
+        log.info("uninstall entry now shows v%s", VERSION)
     App().run()
 
 
