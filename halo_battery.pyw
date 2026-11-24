@@ -1016,6 +1016,8 @@ def device_state(st: DeviceStatus, left: str = "", *, language: str = "en") -> s
             state = i18n.translate("state.asleep", language=language, state=state)
         elif left and not st.charging and st.charging_known:
             state = i18n.translate("state.time_left", language=language, state=state, left=left)
+        if st.extra:
+            state += f", {st.extra}"
     return state
 
 

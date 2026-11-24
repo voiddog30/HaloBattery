@@ -33,6 +33,7 @@ class DeviceStatus:
     # Presentation metadata; English approx remains available to diagnostics.
     ui_message: str = ""
     ui_params: dict = field(default_factory=dict)
+    extra: str = ""              # added to the tooltip, e.g. "spare battery 80%"
 
 
 class Provider:
